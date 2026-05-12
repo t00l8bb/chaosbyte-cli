@@ -2,6 +2,35 @@ package main
 
 import "time"
 
+type SpotlightType int
+
+const (
+	SpotWelcome SpotlightType = iota
+	SpotRepo
+	SpotTopic
+	SpotGame
+	SpotHelp
+	SpotShoutout
+)
+
+func (t SpotlightType) String() string {
+	switch t {
+	case SpotWelcome:
+		return "welcome"
+	case SpotRepo:
+		return "repo"
+	case SpotTopic:
+		return "topic"
+	case SpotGame:
+		return "game"
+	case SpotHelp:
+		return "help"
+	case SpotShoutout:
+		return "shoutout"
+	}
+	return "spotlight"
+}
+
 type Comment struct {
 	Author   string
 	Body     string
