@@ -109,6 +109,9 @@ func main() {
 	log.Info("sandbox runtime ready", "kind", rt.Kind(), "root", *sandboxRoot)
 
 	registry := platform.NewRegistry(issuer, st, rt, sandbox.Spec{})
+	for _, slug := range registry.Teams() {
+		log.Info("built-in team", "slug", slug)
+	}
 
 	// Always wire a worktree controller. With --base-repo set, every
 	// session's Acquire provisions a clone off it and bind-mounts at

@@ -17,27 +17,36 @@ import (
 // dispatch switch rather than as function pointers on this struct, which lets
 // handlers reference `builtins` without creating a package-level init cycle.
 type command struct {
-	name string
-	desc string
+	name       string
+	desc       string
+	dispatcher bool // true = Monobyte-only; hidden in chat-only rooms
 }
 
 // builtins is the canonical list of slash commands. Order here is the order
 // shown in autocomplete. Aliases are wired in `aliases` and don't appear here
 // to keep the suggestion strip tidy.
+//
+// dispatcher = true marks Monobyte-only verbs. They are hidden in chat-only
+// rooms (Vibespace) and surfaced only when the room's SurfacesConfig has
+// Dispatcher enabled. The lobby's gating layer enforces the same check at
+// invocation time.
 var builtins = []command{
-	{"/run", "run a binary inside your sandbox (e.g. /run cargo test)"},
-	{"/sh", "run a one-liner shell command inside your sandbox"},
-	{"/pull", "switch your sandbox to a worktree of a local bare git repo"},
-	{"/scratch", "wipe your workspace and start from an empty sandbox"},
-	{"/spotlight", "open the current spotlit project"},
-	{"/blitz", "thirty seconds where the whole chat dances and we name a winner"},
-	{"/themes", "list color themes, or /themes <name> to switch"},
-	{"/me", "third-person action"},
-	{"/who", "list who is here"},
-	{"/clear", "clear scrollback"},
-	{"/help", "show all commands"},
-	{"/leave", "leave the room"},
-	{"/quit", "exit vibespace"},
+	{name: "/run", desc: "run a binary inside your sandbox (e.g. /run cargo test)", dispatcher: true},
+	{name: "/sh", desc: "run a one-liner shell command inside your sandbox", dispatcher: true},
+	{name: "/pull", desc: "switch your sandbox to a worktree of a local bare git repo", dispatcher: true},
+	{name: "/scratch", desc: "wipe your workspace and start from an empty sandbox", dispatcher: true},
+	{name: "/serve", desc: "spawn a dev server inside your sandbox on a port", dispatcher: true},
+	{name: "/unserve", desc: "stop your active serving", dispatcher: true},
+	{name: "/agent", desc: "ask the room's agent to act on your workspace", dispatcher: true},
+	{name: "/spotlight", desc: "open the current spotlit project"},
+	{name: "/blitz", desc: "thirty seconds where the whole chat dances and we name a winner"},
+	{name: "/themes", desc: "list color themes, or /themes <name> to switch"},
+	{name: "/me", desc: "third-person action"},
+	{name: "/who", desc: "list who is here"},
+	{name: "/clear", desc: "clear scrollback"},
+	{name: "/help", desc: "show all commands"},
+	{name: "/leave", desc: "leave the room"},
+	{name: "/quit", desc: "exit vibespace"},
 }
 
 // aliases maps an alternate spelling to its canonical command name. Aliases
@@ -89,11 +98,16 @@ func (s *Screen) handleSlash(text string) (*Screen, tea.Cmd) {
 	case "/who":
 		return s.cmdWho()
 	case "/run", "/sh", "/pull", "/scratch", "/serve", "/unserve", "/agent":
-		// Dispatcher-side verbs: lobby does not interpret these
-		// inline. Publish the raw line as a chat message so every
-		// session sees the user invoking it, then the per-room
-		// dispatcher's Parse picks it up and runs the command in the
-		// actor's sandbox.
+		// Dispatcher-side verbs are Monobyte's build surface. Gate
+		// them: in chat-only rooms (Vibespace flagship) this should
+		// surface a friendly hint, not silently publish. In Monobyte-
+		// enabled rooms, publish the raw line so every session sees
+		// the invocation and the per-room dispatcher picks it up.
+		if !s.cfg.Surfaces.Dispatcher {
+			s.postSystem(fmt.Sprintf("%s is a Monobyte verb. this room is chat-only — try `ssh monobyte@%s` for the build surface.",
+				name, "<host>"))
+			return s, nil
+		}
 		s.postUser(text)
 		return s, nil
 	}
@@ -109,6 +123,11 @@ func (s *Screen) handleSlash(text string) (*Screen, tea.Cmd) {
 func (s *Screen) cmdHelp() (*Screen, tea.Cmd) {
 	lines := []string{"available commands:"}
 	for _, c := range builtins {
+		// Hide Monobyte verbs in chat-only rooms so the help text
+		// matches what the user can actually invoke.
+		if c.dispatcher && !s.cfg.Surfaces.Dispatcher {
+			continue
+		}
 		lines = append(lines, fmt.Sprintf("  %-13s %s", c.name, c.desc))
 	}
 	lines = append(lines, "navigation: esc returns to lobby from any screen · ctrl+c quits")

@@ -2,7 +2,14 @@
 
 ## Project
 
-**vibespace** is a TUI chatroom served over SSH, made by **chaosbyte** (the studio). The flagship instance runs on vibespace.sh. The code in this repo is the SSH server, the single-user dev binary, the headless tracer, and the engines that drive the typographic moments inside the room.
+**chaosbyte-cli** is the shared backend for two products by **chaosbyte** (the studio):
+
+- **Vibespace** — the TUI chatroom. Ships first as a community wedge. Lean: chat, themes, presence, AI mod, blitz games. Reached via `ssh vibespace@host`. Flagship runs on vibespace.sh.
+- **Monobyte** — the IDE layer on top of Vibespace. Lights up the dispatcher surface: `/run`, `/sh`, `/pull`, `/scratch`, `/serve`, `/unserve`, `/agent`. Reached via `ssh monobyte@host`. Optional native macOS app (separate `monobyte-osx` repo) adds the embedded browser pane + contributor strip for visual co-presence.
+
+One server binary. One broker, one identity layer, one event log. Two surfaces, gated by `Surfaces.Dispatcher` on a per-team `RoomConfig`. Vibespace ships with it off; Monobyte ships with it on; team `.toml` files can opt in.
+
+This repo holds the SSH server (`cmd/vibespace-server`), the single-user dev binary (`cmd/vibespace`), the headless tracer (`cmd/vibespace-trace`), the agent-smoke utility (`cmd/agent-smoke`), and the engines that drive the typographic moments inside the room.
 
 ## Build and test
 

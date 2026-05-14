@@ -83,6 +83,10 @@ func NewRegistry(verifier *capability.Issuer, st store.Store, runtime sandbox.Ru
 	flagship := config.DefaultVibespace()
 	r.flagshipSlug = flagship.Slug
 	r.Register(flagship)
+	// The built-in Monobyte team shares the engine but unlocks the
+	// dispatcher surface (/run, /pull, /agent, etc.). One server,
+	// two surfaces, one binary.
+	r.Register(config.DefaultMonobyte())
 	return r
 }
 
