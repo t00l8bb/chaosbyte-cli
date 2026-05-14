@@ -26,6 +26,7 @@ import (
 	"github.com/bchayka/gitstatus/internal/app"
 	"github.com/bchayka/gitstatus/internal/capability"
 	"github.com/bchayka/gitstatus/internal/config"
+	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/platform"
 	"github.com/bchayka/gitstatus/internal/sandbox"
@@ -233,6 +234,25 @@ func handlerFor(reg *platform.Registry, allowlist *identity.Allowlist, issuer *c
 			BorderHi: cfg.Theme.BorderHi,
 			BorderLo: cfg.Theme.BorderLo,
 		})
+
+		// Watch the SSH session for end-of-life so we can publish a
+		// PresenceLeft on the broker. The dispatcher subscribes to
+		// PresenceLeft to release the sandbox + worktree. Without this
+		// hook, abrupt disconnects (Ctrl+C, network drop) would leak
+		// per-session state until shutdown.
+		go func() {
+			<-s.Context().Done()
+			if broker == nil {
+				return
+			}
+			actor := events.Actor{
+				ID:          principal.ID,
+				DisplayName: principal.DisplayName,
+				Kind:        principal.Kind.String(),
+				SessionID:   principal.SessionID,
+			}
+			_ = broker.PublishEvent(events.NewPresenceLeft(slug, actor, "disconnect"))
+		}()
 
 		return app.New(principal, broker, cfg), []tea.ProgramOption{
 			tea.WithAltScreen(),

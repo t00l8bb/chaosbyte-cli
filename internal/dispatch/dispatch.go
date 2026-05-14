@@ -27,6 +27,7 @@ type Broker interface {
 // needs. Same narrowing for tests.
 type Orchestrator interface {
 	Acquire(ctx context.Context, p identity.Principal, spec sandbox.Spec) (sandbox.Sandbox, error)
+	Release(ctx context.Context, p identity.Principal) error
 }
 
 // Dispatcher subscribes to the broker, recognizes slash commands in
@@ -105,22 +106,47 @@ func (d *Dispatcher) loop(ctx context.Context, ch <-chan events.Event) {
 			if !ok {
 				return
 			}
-			chat, isChat := evt.(*events.ChatPosted)
-			if !isChat {
-				continue
+			switch e := evt.(type) {
+			case *events.ChatPosted:
+				parsed, err := Parse(e.Body)
+				if err != nil {
+					continue
+				}
+				d.wg.Add(1)
+				go d.executeSafe(ctx, e, parsed)
+			case *events.PresenceLeft:
+				// Session ended (quit, disconnect, kicked, stalled).
+				// Release the actor's sandbox + worktree so they do
+				// not leak. Best-effort; we ignore the error.
+				p := identity.Principal{
+					ID:          e.Actor.ID,
+					DisplayName: e.Actor.DisplayName,
+					Kind:        principalKindFromActor(e.Actor.Kind),
+					SessionID:   e.Actor.SessionID,
+				}
+				_ = d.orch.Release(ctx, p)
 			}
-			parsed, err := Parse(chat.Body)
-			if err != nil {
-				// Not a command, or malformed. Either way, no dispatch.
-				continue
-			}
-			d.wg.Add(1)
-			go func() {
-				defer d.wg.Done()
-				d.execute(ctx, chat, parsed)
-			}()
 		}
 	}
+}
+
+// executeSafe wraps execute with a panic recovery so a single bad
+// command does not kill the dispatcher's goroutine pool.
+func (d *Dispatcher) executeSafe(ctx context.Context, chat *events.ChatPosted, cmd ParsedCommand) {
+	defer d.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			// Surface the panic to chat as a completed event so the
+			// posting user sees something went wrong. The recovered
+			// goroutine returns without taking the dispatcher down.
+			fakeCmdID := uuid.New()
+			_ = d.broker.PublishEvent(events.NewSandboxCommandCompleted(
+				d.roomID, chat.Actor, fakeCmdID, -1,
+				fmt.Sprintf("dispatcher panic: %v", r),
+			))
+		}
+	}()
+	d.execute(ctx, chat, cmd)
 }
 
 // chunkSize bounds the size of a single SandboxCommandOutput frame.
@@ -178,16 +204,11 @@ func (d *Dispatcher) execute(ctx context.Context, chat *events.ChatPosted, cmd P
 	exitCode, waitErr := proc.Wait(ctx)
 	streamWG.Wait()
 
-	errMsg := ""
+	var runErr error
 	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
-		errMsg = waitErr.Error()
+		runErr = waitErr
 	}
-	d.publishCompleted(actor, commandID, exitCode, nil)
-	if errMsg != "" {
-		// Surface a second completed event with the error for
-		// observability; the first one already carried the exit code.
-		_ = errMsg
-	}
+	d.publishCompleted(actor, commandID, exitCode, runErr)
 }
 
 // pump reads chunks off a stream and publishes them as

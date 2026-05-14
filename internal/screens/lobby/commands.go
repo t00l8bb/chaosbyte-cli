@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/games"
 	"github.com/bchayka/gitstatus/internal/screens"
 	"github.com/bchayka/gitstatus/internal/theme"
@@ -74,6 +75,10 @@ func (s *Screen) handleSlash(text string) (*Screen, tea.Cmd) {
 	case "/clear":
 		return s.cmdClear()
 	case "/quit", "/leave":
+		// Broadcast that this session is ending so the dispatcher can
+		// Release the sandbox + worktree before we bring the screen
+		// down.
+		s.broadcastLeave("quit")
 		return s, screens.Quit()
 	case "/me":
 		return s.cmdMe(args)
@@ -165,6 +170,23 @@ func (s *Screen) cmdThemes(args []string) (*Screen, tea.Cmd) {
 	}
 	s.postSystem(fmt.Sprintf("theme: %s", name))
 	return s, tea.ClearScreen
+}
+
+// broadcastLeave publishes a PresenceLeft event with the supplied
+// reason so the dispatcher can release the actor's sandbox and any
+// other room services tied to the session can tear down. Safe to
+// call when no broker is attached (local mode).
+func (s *Screen) broadcastLeave(reason string) {
+	if s.broker == nil {
+		return
+	}
+	actor := events.Actor{
+		ID:          s.principal.ID,
+		DisplayName: s.principal.DisplayName,
+		Kind:        s.principal.Kind.String(),
+		SessionID:   s.principal.SessionID,
+	}
+	_ = s.broker.PublishEvent(events.NewPresenceLeft("", actor, reason))
 }
 
 func (s *Screen) cmdWho() (*Screen, tea.Cmd) {
