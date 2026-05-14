@@ -65,6 +65,7 @@ func main() {
 	baseBranch := flag.String("base-branch", "", "branch to check out for new worktrees (empty = HEAD)")
 	mountPath := flag.String("mount-path", "/workspace", "path inside the sandbox where the worktree is bind-mounted")
 	proxyAddr := flag.String("proxy-addr", "127.0.0.1:23291", "listen address for the HTTP proxy that fronts /serve dev servers (empty = disabled)")
+	proxyAPIKey := flag.String("proxy-api-key", os.Getenv("VIBESPACE_API_KEY"), "API key required by /api/rooms/<slug>/* endpoints (empty = open, useful for localhost dev)")
 	agentBaseURL := flag.String("agent-base-url", os.Getenv("ANTHROPIC_BASE_URL"), "Anthropic API base URL for the /agent backend (e.g. http://127.0.0.1:8317 for CLIProxyAPI; default api.anthropic.com)")
 	agentAPIKey := flag.String("agent-api-key", os.Getenv("ANTHROPIC_API_KEY"), "API key for the /agent backend (CLIProxyAPI accepts its configured api-keys[]; Anthropic direct accepts a real sk-ant-... key)")
 	agentModel := flag.String("agent-model", os.Getenv("ANTHROPIC_MODEL"), "model identifier for /agent (default claude-sonnet-4-5)")
@@ -201,17 +202,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Optional HTTP reverse proxy that fronts /serve dev servers. The
-	// proxy listens on its own address; URL shape is
-	// /u/<actorID>/<path>. Disabled if --proxy-addr is empty.
+	// Optional HTTP server: reverse-proxies /serve dev servers at
+	// /u/<actorID>/* AND exposes the SSE events stream at
+	// /api/rooms/<slug>/events for monobyte-osx clients to keep
+	// their RoomState live. Disabled if --proxy-addr is empty.
 	var proxySrv *proxy.Server
 	if *proxyAddr != "" {
-		proxySrv = proxy.New(*proxyAddr, registry)
+		proxySrv = proxy.New(*proxyAddr, registry, registry, *proxyAPIKey)
 		if err := proxySrv.Start(); err != nil {
 			log.Error("could not start HTTP proxy", "addr", *proxyAddr, "error", err)
 			os.Exit(1)
 		}
-		log.Info("HTTP proxy ready", "addr", *proxyAddr)
+		authed := "open"
+		if *proxyAPIKey != "" {
+			authed = "api-key required"
+		}
+		log.Info("HTTP proxy ready", "addr", *proxyAddr, "api", authed)
 		defer proxySrv.Close()
 	}
 

@@ -52,7 +52,7 @@ func TestProxyForwardsToUpstream(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	p := proxy.New(addr, lookup)
+	p := proxy.New(addr, lookup, nil, "")
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestProxyMissingActorReturns404(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	p := proxy.New(addr, fakeLookup{})
+	p := proxy.New(addr, fakeLookup{}, nil, "")
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestProxyHealthz(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	p := proxy.New(addr, fakeLookup{})
+	p := proxy.New(addr, fakeLookup{}, nil, "")
 	_ = p.Start()
 	defer p.Close()
 	waitForListen(t, addr, 1*time.Second)

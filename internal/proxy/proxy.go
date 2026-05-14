@@ -16,6 +16,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/room"
 )
 
@@ -36,17 +38,34 @@ type ServingLookup interface {
 	LookupServingByActor(actorID string) (room.Serving, bool)
 }
 
+// BrokerLookup returns the room.Broker for a given team slug. The
+// SSE events endpoint uses it to subscribe to the team's event
+// stream. Implementations: the platform Registry.
+type BrokerLookup interface {
+	BrokerForSlug(slug string) (*room.Broker, bool)
+}
+
 // Server is the HTTP reverse-proxy server.
 type Server struct {
-	lookup ServingLookup
-	addr   string
-	srv    *http.Server
+	lookup  ServingLookup
+	brokers BrokerLookup // optional; nil disables the /api/rooms/* endpoints
+	apiKey  string       // optional; when non-empty, /api/* requires it
+	addr    string
+	srv     *http.Server
 }
 
 // New returns a proxy Server bound to addr. The server does not
-// start listening until Start is called.
-func New(addr string, lookup ServingLookup) *Server {
-	return &Server{lookup: lookup, addr: addr}
+// start listening until Start is called. brokers is optional; when
+// nil the /api/rooms/* endpoints return 503. apiKey is optional;
+// when set, /api/rooms/* requires Authorization: Bearer or
+// X-API-Key matching it.
+func New(addr string, lookup ServingLookup, brokers BrokerLookup, apiKey string) *Server {
+	return &Server{
+		lookup:  lookup,
+		brokers: brokers,
+		apiKey:  apiKey,
+		addr:    addr,
+	}
 }
 
 // Start begins serving in a goroutine. Returns immediately. Close
@@ -54,6 +73,7 @@ func New(addr string, lookup ServingLookup) *Server {
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/u/", s.handleUser)
+	mux.HandleFunc("/api/rooms/", s.handleAPIRooms)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -116,6 +136,160 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 	rp.ServeHTTP(w, r)
+}
+
+// handleAPIRooms routes /api/rooms/<slug>/... requests. v1 supports:
+//
+//	GET /api/rooms/<slug>/events      Server-Sent Events stream of
+//	                                  room events (PresenceJoined,
+//	                                  PresenceLeft, SandboxServing,
+//	                                  SandboxServingGone, ChatPosted).
+//	                                  Each event arrives as one SSE
+//	                                  "data: <json>" frame.
+//	GET /api/rooms/<slug>/presence    JSON snapshot of current room
+//	                                  members.
+//	GET /api/rooms/<slug>/servings    JSON snapshot of current servings.
+//
+// Used by the monobyte-osx native app to maintain a live RoomState
+// without needing its own SSH client.
+func (s *Server) handleAPIRooms(w http.ResponseWriter, r *http.Request) {
+	if s.brokers == nil {
+		http.Error(w, "events endpoint disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.checkAPIKey(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="vibespace"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+	slug, subpath, _ := strings.Cut(rest, "/")
+	if slug == "" {
+		http.Error(w, "expected /api/rooms/<slug>/...", http.StatusBadRequest)
+		return
+	}
+	broker, ok := s.brokers.BrokerForSlug(slug)
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown room %q", slug), http.StatusNotFound)
+		return
+	}
+	switch subpath {
+	case "events":
+		s.streamRoomEvents(w, r, broker)
+	case "presence":
+		serveJSON(w, broker.Presence())
+	case "servings":
+		serveJSON(w, broker.Servings())
+	default:
+		http.Error(w, "unknown subpath", http.StatusNotFound)
+	}
+}
+
+// checkAPIKey returns true if no apiKey is configured (open mode) or
+// the request supplies the matching key via Authorization: Bearer or
+// X-API-Key.
+func (s *Server) checkAPIKey(r *http.Request) bool {
+	if s.apiKey == "" {
+		return true
+	}
+	if got := r.Header.Get("X-API-Key"); got != "" && got == s.apiKey {
+		return true
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		if strings.TrimPrefix(auth, "Bearer ") == s.apiKey {
+			return true
+		}
+	}
+	return false
+}
+
+// streamRoomEvents subscribes to the broker and forwards each event
+// as an SSE frame until the client disconnects.
+func (s *Server) streamRoomEvents(w http.ResponseWriter, r *http.Request, broker brokerSubscriber) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// First frame: a "hello" with the current presence + servings
+	// snapshot so the client does not need to make two requests to
+	// bootstrap its state.
+	type bootstrap struct {
+		Kind     string      `json:"kind"`
+		Presence interface{} `json:"presence"`
+		Servings interface{} `json:"servings"`
+	}
+	if snap, ok := broker.(snapshotSource); ok {
+		raw, _ := json.Marshal(bootstrap{
+			Kind:     "bootstrap",
+			Presence: snap.Presence(),
+			Servings: snap.Servings(),
+		})
+		fmt.Fprintf(w, "data: %s\n\n", raw)
+		flusher.Flush()
+	}
+
+	subID, ch := broker.Subscribe()
+	defer broker.Unsubscribe(subID)
+
+	// Periodic keepalive so intermediaries (proxies, browser SSE
+	// implementations) do not time the connection out during idle
+	// rooms.
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		case evt, open := <-ch:
+			if !open {
+				return
+			}
+			raw, err := events.Marshal(evt)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventKind(), raw)
+			flusher.Flush()
+		}
+	}
+}
+
+// brokerSubscriber is the narrowest broker surface the SSE handler
+// needs.
+type brokerSubscriber interface {
+	Subscribe() (room.SubscriberID, <-chan events.Event)
+	Unsubscribe(room.SubscriberID)
+}
+
+// snapshotSource exposes the presence + servings snapshots so the
+// SSE handler can send a bootstrap frame before live events flow.
+type snapshotSource interface {
+	Presence() []events.Actor
+	Servings() []room.Serving
+}
+
+// serveJSON writes v as a JSON response. Used by the snapshot
+// endpoints.
+func serveJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	raw, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(raw)
 }
 
 // scheme returns a sane http scheme for the proxied URL. The broker

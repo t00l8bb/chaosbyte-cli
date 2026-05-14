@@ -171,6 +171,16 @@ func (r *Registry) Resolve(slug string) (config.RoomConfig, *room.Broker) {
 	return r.configs[r.flagshipSlug], r.brokers[r.flagshipSlug]
 }
 
+// BrokerForSlug returns the room.Broker for the supplied team slug
+// (e.g. "vibespace", "monobyte"). Returns (nil, false) for unknown
+// slugs. Used by the HTTP proxy's SSE events endpoint.
+func (r *Registry) BrokerForSlug(slug string) (*room.Broker, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.brokers[slug]
+	return b, ok
+}
+
 // LookupServingByActor returns the active dev-server Serving for the
 // given actor id across every registered team. Returns (zero, false)
 // if no team has a serving for that id. Used by the HTTP proxy to

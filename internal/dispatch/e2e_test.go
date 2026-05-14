@@ -459,7 +459,7 @@ func TestServeAndProxyFullChain(t *testing.T) {
 
 	// Start the proxy on its own free port.
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	p := proxy.New(proxyAddr, &brokerLookup{b: b})
+	p := proxy.New(proxyAddr, &brokerLookup{b: b}, nil, "")
 	_ = p.Start()
 	defer p.Close()
 	waitForProxy(t, proxyAddr)
