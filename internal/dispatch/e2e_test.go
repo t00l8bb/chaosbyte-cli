@@ -2,6 +2,10 @@ package dispatch_test
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +18,7 @@ import (
 
 	"github.com/bchayka/gitstatus/internal/dispatch"
 	"github.com/bchayka/gitstatus/internal/events"
+	"github.com/bchayka/gitstatus/internal/proxy"
 	"github.com/bchayka/gitstatus/internal/room"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
@@ -413,6 +418,189 @@ func TestScratchProducesEmptyWorkspace(t *testing.T) {
 	if strings.TrimSpace(postBody.String()) != "" {
 		t.Errorf("scratch workspace should be empty; ls -1A returned %q", postBody.String())
 	}
+}
+
+// TestServeAndProxyFullChain is the load-bearing co-presence test.
+// It boots the real host runtime, real broker, real dispatcher, real
+// proxy, and a real /serve of python3 -m http.server. Then it hits
+// the proxy URL with an HTTP client and asserts the response came
+// from the dev server inside the sandbox.
+//
+// Skipped when python3 is not on PATH.
+func TestServeAndProxyFullChain(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("host sandbox only on darwin/linux, got %s", runtime.GOOS)
+	}
+	if _, err := lookPathTest("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	rt, err := sbhost.New(t.TempDir())
+	if err != nil {
+		t.Skipf("host backend unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	wtCtrl, err := plainController(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(wtCtrl, "", "", "/workspace")
+	b := room.New("test", nil, nil, nil)
+	defer b.Stop()
+
+	d := dispatch.New(b, orch, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = d.Start(ctx)
+	defer d.Stop()
+
+	// Pick a free port for python http.server.
+	port := freePort(t)
+
+	// Start the proxy on its own free port.
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	p := proxy.New(proxyAddr, &brokerLookup{b: b})
+	_ = p.Start()
+	defer p.Close()
+	waitForProxy(t, proxyAddr)
+
+	_, obs := b.Subscribe()
+	actor := events.Actor{ID: "pk:full", DisplayName: "@d", Kind: "human", SessionID: uuid.New()}
+	chatBody := fmt.Sprintf("/serve %d python3 -m http.server %d --bind 127.0.0.1", port, port)
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", chatBody, ui.ChatNormal))
+
+	// Wait for the serving event so we know the dev server is up.
+	drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if s, ok := e.(*events.SandboxServing); ok && s.Port == port {
+				return true
+			}
+		}
+		return false
+	})
+
+	// python3 -m http.server takes ~50ms to bind. Wait for the port.
+	waitForTCP(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+
+	// Hit the proxy and confirm we got the python http.server
+	// directory listing back (it returns HTML with "Directory listing"
+	// in the title).
+	resp, err := http.Get(fmt.Sprintf("http://%s/u/pk:full/", proxyAddr))
+	if err != nil {
+		t.Fatalf("proxy GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("proxy status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Directory listing") {
+		t.Errorf("proxy body did not look like python http.server response: %q", string(body))
+	}
+}
+
+// brokerLookup adapts *room.Broker to proxy.ServingLookup.
+type brokerLookup struct{ b *room.Broker }
+
+func (l *brokerLookup) LookupServingByActor(actorID string) (room.Serving, bool) {
+	return l.b.LookupServing(actorID)
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func waitForTCP(t *testing.T, addr string, max time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("never reached %s", addr)
+}
+
+func waitForProxy(t *testing.T, addr string) {
+	t.Helper()
+	waitForTCP(t, addr, 1*time.Second)
+}
+
+// lookPathTest wraps exec.LookPath so the test doesn't need to import
+// os/exec directly twice (already used by setupBareRepoForDispatchTest).
+func lookPathTest(name string) (string, error) {
+	return exec.LookPath(name)
+}
+
+// TestServeRegistersBrokerServing fires /serve through the real
+// pipeline and asserts the broker's Servings() table reflects the
+// running dev server. Uses /bin/sh as the "dev server" so we do not
+// depend on any specific tool being installed; the shell sleeps so
+// the proc stays alive long enough for the event to land.
+func TestServeRegistersBrokerServing(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("host sandbox only on darwin/linux, got %s", runtime.GOOS)
+	}
+	rt, err := sbhost.New(t.TempDir())
+	if err != nil {
+		t.Skipf("host backend unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	wtCtrl, err := plainController(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(wtCtrl, "", "", "/workspace")
+	b := room.New("test", nil, nil, nil)
+	defer b.Stop()
+
+	d := dispatch.New(b, orch, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = d.Start(ctx)
+	defer d.Stop()
+
+	_, obs := b.Subscribe()
+	actor := events.Actor{ID: "pk:serve", DisplayName: "@daniel", Kind: "human", SessionID: uuid.New()}
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/serve 3001 /bin/sh -c sleep\\ 5", ui.ChatNormal))
+
+	// Wait for the SandboxServing event to fly.
+	drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if _, ok := e.(*events.SandboxServing); ok {
+				return true
+			}
+		}
+		return false
+	})
+
+	if s, ok := b.LookupServing("pk:serve"); !ok {
+		t.Fatalf("broker should have a serving for pk:serve")
+	} else if s.Port != 3001 {
+		t.Errorf("serving port = %d, want 3001", s.Port)
+	}
+
+	// /unserve clears the entry.
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/unserve", ui.ChatNormal))
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := b.LookupServing("pk:serve"); !ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("serving should be cleared after /unserve")
 }
 
 // TestDispatcherSurvivesCommandPanic exercises the recover() guard:
