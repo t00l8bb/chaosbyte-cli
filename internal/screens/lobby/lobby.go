@@ -478,6 +478,10 @@ func (s *Screen) handleRoomEvent(evt events.Event) {
 		s.handleSandboxOutput(e)
 	case *events.SandboxCommandCompleted:
 		s.handleSandboxCompleted(e)
+	case *events.AgentSaid:
+		s.handleAgentSaid(e)
+	case *events.AgentToolCalled:
+		s.handleAgentToolCalled(e)
 	default:
 		// Unknown events from a future build land here. Quietly drop;
 		// the broker has already persisted them.
@@ -544,6 +548,39 @@ func (s *Screen) handleSandboxCompleted(e *events.SandboxCommandCompleted) {
 	}
 	s.appendSystem(inf.channel, fmt.Sprintf("  exit %d", e.ExitCode))
 	delete(s.inflightCommands, e.CommandID)
+}
+
+// handleAgentSaid renders an agent's text reply as a system line in
+// the active channel. Authorship is preserved via the actor's display
+// name on the event so multi-user rooms know whose agent spoke.
+func (s *Screen) handleAgentSaid(e *events.AgentSaid) {
+	channel := s.activeChannelName()
+	display := e.Actor.DisplayName
+	if display == "" {
+		display = "agent"
+	}
+	s.appendSystem(channel, fmt.Sprintf("%s's agent: %s", display, e.Text))
+}
+
+// handleAgentToolCalled surfaces the tool the agent invoked. Useful
+// for trust and review; rendered as a faint indented line so it does
+// not dominate the channel.
+func (s *Screen) handleAgentToolCalled(e *events.AgentToolCalled) {
+	channel := s.activeChannelName()
+	mark := "·"
+	if e.IsError {
+		mark = "!"
+	}
+	s.appendSystem(channel, fmt.Sprintf("  %s %s(%s)", mark, e.Tool, summarizeArgs(e.Args)))
+}
+
+// summarizeArgs returns a compact display of a JSON args blob: keeps
+// it under 80 chars, truncates to "...".
+func summarizeArgs(argsJSON string) string {
+	if len(argsJSON) <= 80 {
+		return argsJSON
+	}
+	return argsJSON[:77] + "..."
 }
 
 // appendSystem appends a ChatSystem message to the named channel's

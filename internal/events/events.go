@@ -209,6 +209,18 @@ func Unmarshal(data []byte) (Event, error) {
 			return nil, fmt.Errorf("events: unmarshal sandbox.serving.gone payload: %w", err)
 		}
 		return &SandboxServingGone{Header: h, UserSessionID: p.UserSessionID, Reason: p.Reason}, nil
+	case kindAgentSaid:
+		var p agentSaidPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal agent.said payload: %w", err)
+		}
+		return &AgentSaid{Header: h, StepID: p.StepID, Text: p.Text}, nil
+	case kindAgentToolCalled:
+		var p agentToolCalledPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal agent.tool.called payload: %w", err)
+		}
+		return &AgentToolCalled{Header: h, StepID: p.StepID, Tool: p.Tool, Args: p.Args, Result: p.Result, IsError: p.IsError}, nil
 	default:
 		return &Unknown{Header: h, Kind_: env.Kind, RawPayload: env.Payload}, nil
 	}

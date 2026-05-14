@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bchayka/gitstatus/internal/agent"
 	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/room"
@@ -53,6 +55,11 @@ type Dispatcher struct {
 	orch   Orchestrator
 	roomID string
 
+	// agentFactory builds a per-session agent on first /agent
+	// invocation. nil means the room has no agent backend; /agent
+	// will return an error to chat.
+	agentFactory AgentFactory
+
 	mu      sync.Mutex
 	started bool
 	stopped bool
@@ -64,7 +71,19 @@ type Dispatcher struct {
 	// Actor.ID). /serve registers an entry; /unserve, PresenceLeft,
 	// or the process exiting clears it.
 	servings map[string]*serving
+
+	// agents caches one agent per actor (keyed by Actor.ID).
+	// Constructed lazily on first /agent. PresenceLeft clears.
+	agents map[string]agent.Agent
 }
+
+// AgentFactory builds an Agent for the supplied principal. The
+// dispatcher caches the result keyed by SessionID. Implementations
+// pick a backend (stub for tests, Claude in production), pass the
+// actor's sandbox + worktree path in, and return a ready-to-Step
+// agent. nil error + nil agent means the factory chose not to build
+// one for this principal (e.g. ANTHROPIC_API_KEY missing).
+type AgentFactory func(p identity.Principal) (agent.Agent, error)
 
 // serving bundles the live dev-server process with the cancel
 // function that kills it.
@@ -83,7 +102,15 @@ func New(broker Broker, orch Orchestrator, roomID string) *Dispatcher {
 		roomID:   roomID,
 		stopCh:   make(chan struct{}),
 		servings: map[string]*serving{},
+		agents:   map[string]agent.Agent{},
 	}
+}
+
+// WithAgentFactory configures the agent backend. Without this,
+// /agent in chat surfaces an "agent not configured" error.
+func (d *Dispatcher) WithAgentFactory(f AgentFactory) *Dispatcher {
+	d.agentFactory = f
+	return d
 }
 
 // Start subscribes to the broker and begins routing slash commands.
@@ -141,10 +168,13 @@ func (d *Dispatcher) loop(ctx context.Context, ch <-chan events.Event) {
 				go d.executeSafe(ctx, e, parsed)
 			case *events.PresenceLeft:
 				// Session ended (quit, disconnect, kicked, stalled).
-				// Stop any /serve they had running, then release the
-				// actor's sandbox + worktree so they do not leak.
-				// Best-effort; we ignore the error.
+				// Stop any /serve they had running, drop the cached
+				// agent, then release the actor's sandbox + worktree
+				// so they do not leak. Best-effort; we ignore errors.
 				d.stopServing(ctx, e.Actor.ID, "disconnect")
+				d.mu.Lock()
+				delete(d.agents, e.Actor.ID)
+				d.mu.Unlock()
 				p := identity.Principal{
 					ID:          e.Actor.ID,
 					DisplayName: e.Actor.DisplayName,
@@ -220,6 +250,10 @@ func (d *Dispatcher) execute(ctx context.Context, chat *events.ChatPosted, cmd P
 	}
 	if cmd.Verb == VerbUnserve {
 		d.executeUnserve(ctx, actor, commandID)
+		return
+	}
+	if cmd.Verb == VerbAgent {
+		d.executeAgent(ctx, actor, principal, commandID, cmd.Raw)
 		return
 	}
 
@@ -446,6 +480,51 @@ func (d *Dispatcher) stopServing(ctx context.Context, actorID, reason string) bo
 	// The goroutine started in executeServe will publish the
 	// ServingGone via the natural exit path.
 	return true
+}
+
+// executeAgent routes a /agent prompt through the actor's cached
+// agent. The agent's text reply lands as one AgentSaid card; each
+// tool invocation it made during the Step lands as an
+// AgentToolCalled card so the audit trail is visible.
+func (d *Dispatcher) executeAgent(ctx context.Context, actor events.Actor, principal identity.Principal, commandID uuid.UUID, prompt string) {
+	if d.agentFactory == nil {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/agent: no agent backend configured on this server"))
+		return
+	}
+	d.mu.Lock()
+	ag, ok := d.agents[actor.ID]
+	if !ok {
+		built, err := d.agentFactory(principal)
+		if err != nil {
+			d.mu.Unlock()
+			d.publishCompleted(actor, commandID, -1, fmt.Errorf("/agent: build: %w", err))
+			return
+		}
+		if built == nil {
+			d.mu.Unlock()
+			d.publishCompleted(actor, commandID, -1, fmt.Errorf("/agent: backend declined to build an agent for this session"))
+			return
+		}
+		d.agents[actor.ID] = built
+		ag = built
+	}
+	d.mu.Unlock()
+
+	stepID := uuid.New()
+	resp, err := ag.Step(ctx, prompt)
+	if err != nil {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/agent: %w", err))
+		return
+	}
+	// Surface every tool call as its own card.
+	for _, tc := range resp.ToolCalls {
+		argsJSON, _ := json.Marshal(tc.Args)
+		_ = d.broker.PublishEvent(events.NewAgentToolCalled(d.roomID, actor, stepID, tc.Name, string(argsJSON), tc.Result, tc.IsError))
+	}
+	if resp.Text != "" {
+		_ = d.broker.PublishEvent(events.NewAgentSaid(d.roomID, actor, stepID, resp.Text))
+	}
+	d.publishCompleted(actor, commandID, 0, nil)
 }
 
 // isURL is a coarse predicate for "looks like a remote URL." Used by

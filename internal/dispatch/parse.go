@@ -30,6 +30,7 @@ const (
 	VerbScratch Verb = "scratch"
 	VerbServe   Verb = "serve"
 	VerbUnserve Verb = "unserve"
+	VerbAgent   Verb = "agent"
 )
 
 // ParsedCommand is the structured form of a recognized slash command.
@@ -117,6 +118,16 @@ func Parse(body string) (ParsedCommand, error) {
 			Verb: VerbUnserve,
 			Argv: nil,
 			Raw:  rest,
+		}, nil
+	case VerbAgent:
+		prompt := strings.TrimSpace(rest)
+		if prompt == "" {
+			return ParsedCommand{}, fmt.Errorf("dispatch: /agent requires a prompt")
+		}
+		return ParsedCommand{
+			Verb: VerbAgent,
+			Argv: []string{prompt},
+			Raw:  prompt,
 		}, nil
 	default:
 		return ParsedCommand{}, ErrNotACommand
