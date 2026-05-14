@@ -23,15 +23,19 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bchayka/gitstatus/internal/agent"
+	"github.com/bchayka/gitstatus/internal/agent/tools"
 	"github.com/bchayka/gitstatus/internal/app"
 	"github.com/bchayka/gitstatus/internal/capability"
 	"github.com/bchayka/gitstatus/internal/config"
+	"github.com/bchayka/gitstatus/internal/dispatch"
 	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/platform"
 	"github.com/bchayka/gitstatus/internal/proxy"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
+	"github.com/bchayka/gitstatus/internal/worktree"
 	"github.com/bchayka/gitstatus/internal/worktree/plain"
 	"github.com/bchayka/gitstatus/internal/store/sqlite"
 	"github.com/bchayka/gitstatus/internal/theme"
@@ -61,6 +65,9 @@ func main() {
 	baseBranch := flag.String("base-branch", "", "branch to check out for new worktrees (empty = HEAD)")
 	mountPath := flag.String("mount-path", "/workspace", "path inside the sandbox where the worktree is bind-mounted")
 	proxyAddr := flag.String("proxy-addr", "127.0.0.1:23291", "listen address for the HTTP proxy that fronts /serve dev servers (empty = disabled)")
+	agentBaseURL := flag.String("agent-base-url", os.Getenv("ANTHROPIC_BASE_URL"), "Anthropic API base URL for the /agent backend (e.g. http://127.0.0.1:8317 for CLIProxyAPI; default api.anthropic.com)")
+	agentAPIKey := flag.String("agent-api-key", os.Getenv("ANTHROPIC_API_KEY"), "API key for the /agent backend (CLIProxyAPI accepts its configured api-keys[]; Anthropic direct accepts a real sk-ant-... key)")
+	agentModel := flag.String("agent-model", os.Getenv("ANTHROPIC_MODEL"), "model identifier for /agent (default claude-sonnet-4-5)")
 	flag.Parse()
 
 	allowlist, err := identity.LoadAllowlist(*keyfile)
@@ -119,6 +126,43 @@ func main() {
 		log.Info("worktree provisioning enabled", "base-repo", *baseRepo, "branch", *baseBranch, "mount", *mountPath, "root", *worktreeRoot)
 	} else {
 		log.Info("worktree controller ready; sessions start empty (users can /pull or /scratch)", "mount", *mountPath, "root", *worktreeRoot)
+	}
+
+	// Optional /agent backend: if an API key is configured, build a
+	// Claude agent for each session lazily. Tools (read_file,
+	// write_file, list_dir, run, diff) are bound to the actor's
+	// sandbox + worktree at construction time.
+	if *agentAPIKey != "" {
+		baseURL := *agentBaseURL
+		if baseURL == "" {
+			baseURL = agent.DefaultClaudeBaseURL
+		}
+		log.Info("agent backend enabled",
+			"base-url", baseURL,
+			"model", coalesce(*agentModel, agent.DefaultClaudeModel),
+		)
+		registry.WithAgentBuilder(func(orch *sandbox.Orchestrator, _ worktree.Controller, _ string) dispatch.AgentFactory {
+			return func(p identity.Principal) (agent.Agent, error) {
+				// Acquire the actor's sandbox so the tools can call
+				// into it. Acquire is idempotent: subsequent /agent
+				// calls re-use the same sandbox.
+				sb, err := orch.Acquire(context.Background(), p, sandbox.Spec{})
+				if err != nil {
+					return nil, err
+				}
+				workspace := orch.WorkspacePath(p.SessionID)
+				toolset := tools.DefaultSet(sb, workspace)
+				opts := []agent.ClaudeOption{
+					agent.WithClaudeBaseURL(baseURL),
+				}
+				if *agentModel != "" {
+					opts = append(opts, agent.WithClaudeModel(*agentModel))
+				}
+				return agent.NewClaude(*agentAPIKey, toolset, opts...), nil
+			}
+		})
+	} else {
+		log.Info("agent backend disabled (set --agent-api-key or ANTHROPIC_API_KEY to enable /agent)")
 	}
 	if loaded, err := config.LoadFromDir(*configsDir); err != nil {
 		log.Warn("could not read configs directory", "dir", *configsDir, "error", err)
@@ -291,6 +335,16 @@ func handlerFor(reg *platform.Registry, allowlist *identity.Allowlist, issuer *c
 			tea.WithMouseCellMotion(),
 		}
 	}
+}
+
+// coalesce returns the first non-empty string from its arguments.
+func coalesce(strs ...string) string {
+	for _, s := range strs {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // sshKeyToEd25519 extracts the underlying ed25519.PublicKey from a Wish

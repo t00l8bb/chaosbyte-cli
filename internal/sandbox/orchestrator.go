@@ -239,6 +239,19 @@ func (o *Orchestrator) Lookup(sessionID uuid.UUID) Sandbox {
 	return nil
 }
 
+// WorkspacePath returns the host-side filesystem path of the actor's
+// current worktree, or empty if the session has no worktree mount.
+// Used by the agent factory to bind tools to the right workspace.
+func (o *Orchestrator) WorkspacePath(sessionID uuid.UUID) string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	sess, ok := o.byUser[sessionID]
+	if !ok || sess.worktree == nil {
+		return ""
+	}
+	return sess.worktree.Path()
+}
+
 // Close destroys every live sandbox and worktree and shuts the
 // underlying Runtime down. The orchestrator becomes unusable
 // afterward.

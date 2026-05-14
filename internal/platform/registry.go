@@ -30,6 +30,12 @@ import (
 	"github.com/bchayka/gitstatus/internal/worktree"
 )
 
+// AgentFactoryBuilder constructs a dispatch.AgentFactory bound to a
+// specific Orchestrator and worktree controller for one team. The
+// platform Registry calls this once per Register so the agent's
+// tools can see the right per-session sandbox + workspace.
+type AgentFactoryBuilder func(orch *sandbox.Orchestrator, wt worktree.Controller, mountPath string) dispatch.AgentFactory
+
 // Registry holds the active set of teams and routes incoming connections
 // to the right one. Safe for concurrent use.
 type Registry struct {
@@ -47,6 +53,7 @@ type Registry struct {
 	baseRepo     string
 	branch       string
 	mountPath    string
+	agentBuilder AgentFactoryBuilder
 	ctx          context.Context
 	cancel       context.CancelFunc
 }
@@ -76,6 +83,24 @@ func NewRegistry(verifier *capability.Issuer, st store.Store, runtime sandbox.Ru
 	flagship := config.DefaultVibespace()
 	r.flagshipSlug = flagship.Slug
 	r.Register(flagship)
+	return r
+}
+
+// WithAgentBuilder configures the per-room agent backend. The
+// supplied builder is invoked once per Register and the resulting
+// AgentFactory is wired into that team's Dispatcher. Without this,
+// /agent in chat surfaces "no agent backend configured."
+func (r *Registry) WithAgentBuilder(b AgentFactoryBuilder) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agentBuilder = b
+	// Apply to existing dispatchers (only the flagship at this
+	// point in practice).
+	for slug, d := range r.dispatchers {
+		if orch, ok := r.orchs[slug]; ok {
+			d.WithAgentFactory(b(orch, r.worktrees, r.mountPath))
+		}
+	}
 	return r
 }
 
@@ -120,6 +145,9 @@ func (r *Registry) Register(cfg config.RoomConfig) {
 			}
 			r.orchs[cfg.Slug] = orch
 			d := dispatch.New(broker, orch, cfg.Slug)
+			if r.agentBuilder != nil {
+				d.WithAgentFactory(r.agentBuilder(orch, r.worktrees, r.mountPath))
+			}
 			if err := d.Start(r.ctx); err == nil {
 				r.dispatchers[cfg.Slug] = d
 			}
