@@ -12,10 +12,10 @@ import (
 )
 
 // DefaultClaudeModel is the model we hit when no override is set.
-// claude-sonnet-4-5 is a good speed/quality tradeoff for an
-// interactive tool-using agent and is what CLIProxyAPI exposes by
-// default when Claude Max OAuth is the backing auth.
-const DefaultClaudeModel = "claude-sonnet-4-5"
+// claude-sonnet-4-6 is the current sweet spot for an interactive
+// tool-using agent: fast, strong tool use, exposed by CLIProxyAPI
+// against Claude Max OAuth.
+const DefaultClaudeModel = "claude-sonnet-4-6"
 
 // DefaultClaudeBaseURL targets Anthropic directly. Override with
 // WithClaudeBaseURL to point at a local proxy like CLIProxyAPI
