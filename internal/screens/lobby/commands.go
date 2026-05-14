@@ -25,6 +25,10 @@ type command struct {
 // shown in autocomplete. Aliases are wired in `aliases` and don't appear here
 // to keep the suggestion strip tidy.
 var builtins = []command{
+	{"/run", "run a binary inside your sandbox (e.g. /run cargo test)"},
+	{"/sh", "run a one-liner shell command inside your sandbox"},
+	{"/pull", "switch your sandbox to a worktree of a local bare git repo"},
+	{"/scratch", "wipe your workspace and start from an empty sandbox"},
 	{"/spotlight", "open the current spotlit project"},
 	{"/blitz", "thirty seconds where the whole chat dances and we name a winner"},
 	{"/themes", "list color themes, or /themes <name> to switch"},
