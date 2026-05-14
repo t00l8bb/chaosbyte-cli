@@ -179,6 +179,48 @@ func Unmarshal(data []byte) (Event, error) {
 			return nil, fmt.Errorf("events: unmarshal mod.tagged payload: %w", err)
 		}
 		return &ModTagged{Header: h, TargetEventID: p.TargetEventID, Marker: p.Marker, Reason: p.Reason}, nil
+	case kindSandboxCommandIssued:
+		var p sandboxCommandIssuedPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.command.issued payload: %w", err)
+		}
+		return &SandboxCommandIssued{Header: h, CommandID: p.CommandID, SessionID: p.SessionID, Channel: p.Channel, Argv: p.Argv, WorkingDir: p.WorkingDir, TTY: p.TTY}, nil
+	case kindSandboxCommandOutput:
+		var p sandboxCommandOutputPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.command.output payload: %w", err)
+		}
+		return &SandboxCommandOutput{Header: h, CommandID: p.CommandID, Stream: p.Stream, Chunk: p.Chunk}, nil
+	case kindSandboxCommandCompleted:
+		var p sandboxCommandCompletedPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.command.completed payload: %w", err)
+		}
+		return &SandboxCommandCompleted{Header: h, CommandID: p.CommandID, ExitCode: p.ExitCode, Error: p.Error}, nil
+	case kindSandboxServing:
+		var p sandboxServingPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.serving payload: %w", err)
+		}
+		return &SandboxServing{Header: h, UserSessionID: p.UserSessionID, Label: p.Label, Port: p.Port, Scheme: p.Scheme}, nil
+	case kindSandboxServingGone:
+		var p sandboxServingGonePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.serving.gone payload: %w", err)
+		}
+		return &SandboxServingGone{Header: h, UserSessionID: p.UserSessionID, Reason: p.Reason}, nil
+	case kindAgentSaid:
+		var p agentSaidPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal agent.said payload: %w", err)
+		}
+		return &AgentSaid{Header: h, StepID: p.StepID, Text: p.Text}, nil
+	case kindAgentToolCalled:
+		var p agentToolCalledPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal agent.tool.called payload: %w", err)
+		}
+		return &AgentToolCalled{Header: h, StepID: p.StepID, Tool: p.Tool, Args: p.Args, Result: p.Result, IsError: p.IsError}, nil
 	default:
 		return &Unknown{Header: h, Kind_: env.Kind, RawPayload: env.Payload}, nil
 	}

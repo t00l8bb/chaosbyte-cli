@@ -28,6 +28,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
 )
 
 // Screen is the lobby's own state. The chat input is always focused, so this
@@ -89,6 +90,21 @@ type Screen struct {
 	// blitz.OnNewMessage. Once blitz.Done flips, the lobby names the
 	// winner and clears the field.
 	blitz *games.Blitz
+
+	// inflightCommands tracks /run and /sh commands the local actor or
+	// other session participants have issued. Keyed by CommandID so
+	// SandboxCommandOutput frames can flush full lines to the right
+	// channel and preserve mid-chunk partial lines.
+	inflightCommands map[uuid.UUID]*inflightCommand
+}
+
+// inflightCommand carries the per-command state needed to render
+// streaming SandboxCommandOutput events as orderly chat lines.
+type inflightCommand struct {
+	channel    string
+	authorTag  string
+	stdoutBuf  []byte
+	stderrBuf  []byte
 }
 
 // msgPlacement records where one chat message's body lives in the rendered
@@ -112,17 +128,18 @@ func New(principal identity.Principal, broker *room.Broker, cfg config.RoomConfi
 		nick = "@boggy"
 	}
 	s := &Screen{
-		principal:     principal,
-		nick:          nick,
-		channels:      seedChannels(),
-		chatActive:    0,
-		input:         newInput(),
-		backdrop:      field.NewBackdrop(),
-		mod:           mod.New(),
-		broker:        broker,
-		lobbyIdx:      -1,
-		choreographer: typo.NewChoreographer(),
-		cfg:           cfg,
+		principal:        principal,
+		nick:             nick,
+		channels:         seedChannels(),
+		chatActive:       0,
+		input:            newInput(),
+		backdrop:         field.NewBackdrop(),
+		mod:              mod.New(),
+		broker:           broker,
+		lobbyIdx:         -1,
+		choreographer:    typo.NewChoreographer(),
+		cfg:              cfg,
+		inflightCommands: map[uuid.UUID]*inflightCommand{},
 	}
 	for i, ch := range s.channels {
 		if ch.Name == "#lobby" {
@@ -455,11 +472,152 @@ func (s *Screen) handleRoomEvent(evt events.Event) {
 		// Phase 1 mod tags are still attached inline via the
 		// ChatMessage.Tags field on the underlying ChatPosted. This
 		// branch is the hook for future explicit tag events.
+	case *events.SandboxCommandIssued:
+		s.handleSandboxIssued(e)
+	case *events.SandboxCommandOutput:
+		s.handleSandboxOutput(e)
+	case *events.SandboxCommandCompleted:
+		s.handleSandboxCompleted(e)
+	case *events.AgentSaid:
+		s.handleAgentSaid(e)
+	case *events.AgentToolCalled:
+		s.handleAgentToolCalled(e)
 	default:
 		// Unknown events from a future build land here. Quietly drop;
 		// the broker has already persisted them.
 	}
 }
+
+// handleSandboxIssued records the command and renders an "@actor ran:
+// argv" system line in the originating channel.
+func (s *Screen) handleSandboxIssued(e *events.SandboxCommandIssued) {
+	s.inflightCommands[e.CommandID] = &inflightCommand{
+		channel:   e.Channel,
+		authorTag: e.Actor.DisplayName,
+	}
+	body := fmt.Sprintf("%s ran %s", e.Actor.DisplayName, strings.Join(e.Argv, " "))
+	s.appendSystem(e.Channel, body)
+}
+
+// handleSandboxOutput flushes complete lines from an output chunk into
+// the originating channel as system messages. Partial trailing lines
+// are buffered per (command, stream) and emitted when the next chunk
+// arrives.
+func (s *Screen) handleSandboxOutput(e *events.SandboxCommandOutput) {
+	inf, ok := s.inflightCommands[e.CommandID]
+	if !ok {
+		// We may have missed the Issued event; fall back to the active
+		// channel so output is at least visible somewhere.
+		inf = &inflightCommand{channel: s.activeChannelName()}
+		s.inflightCommands[e.CommandID] = inf
+	}
+	var buf *[]byte
+	switch e.Stream {
+	case events.StreamStderr:
+		buf = &inf.stderrBuf
+	default:
+		buf = &inf.stdoutBuf
+	}
+	*buf = append(*buf, e.Chunk...)
+	for {
+		idx := indexOfByte(*buf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := string((*buf)[:idx])
+		*buf = (*buf)[idx+1:]
+		s.appendSystem(inf.channel, "  "+line)
+	}
+}
+
+// handleSandboxCompleted flushes any trailing partial line, prints the
+// exit line, and deletes the inflight entry.
+func (s *Screen) handleSandboxCompleted(e *events.SandboxCommandCompleted) {
+	inf, ok := s.inflightCommands[e.CommandID]
+	if !ok {
+		return
+	}
+	if len(inf.stdoutBuf) > 0 {
+		s.appendSystem(inf.channel, "  "+string(inf.stdoutBuf))
+	}
+	if len(inf.stderrBuf) > 0 {
+		s.appendSystem(inf.channel, "  "+string(inf.stderrBuf))
+	}
+	if e.Error != "" {
+		s.appendSystem(inf.channel, fmt.Sprintf("  error: %s", e.Error))
+	}
+	s.appendSystem(inf.channel, fmt.Sprintf("  exit %d", e.ExitCode))
+	delete(s.inflightCommands, e.CommandID)
+}
+
+// handleAgentSaid renders an agent's text reply as a system line in
+// the active channel. Authorship is preserved via the actor's display
+// name on the event so multi-user rooms know whose agent spoke.
+func (s *Screen) handleAgentSaid(e *events.AgentSaid) {
+	channel := s.activeChannelName()
+	display := e.Actor.DisplayName
+	if display == "" {
+		display = "agent"
+	}
+	s.appendSystem(channel, fmt.Sprintf("%s's agent: %s", display, e.Text))
+}
+
+// handleAgentToolCalled surfaces the tool the agent invoked. Useful
+// for trust and review; rendered as a faint indented line so it does
+// not dominate the channel.
+func (s *Screen) handleAgentToolCalled(e *events.AgentToolCalled) {
+	channel := s.activeChannelName()
+	mark := "·"
+	if e.IsError {
+		mark = "!"
+	}
+	s.appendSystem(channel, fmt.Sprintf("  %s %s(%s)", mark, e.Tool, summarizeArgs(e.Args)))
+}
+
+// summarizeArgs returns a compact display of a JSON args blob: keeps
+// it under 80 chars, truncates to "...".
+func summarizeArgs(argsJSON string) string {
+	if len(argsJSON) <= 80 {
+		return argsJSON
+	}
+	return argsJSON[:77] + "..."
+}
+
+// appendSystem appends a ChatSystem message to the named channel's
+// scrollback. No-op for unknown channels.
+func (s *Screen) appendSystem(channel, body string) {
+	for i := range s.channels {
+		if s.channels[i].Name != channel {
+			continue
+		}
+		s.channels[i].Messages = append(s.channels[i].Messages, ui.ChatMessage{
+			Author: "*",
+			Body:   body,
+			At:     time.Now(),
+			Kind:   ui.ChatSystem,
+		})
+		if i == s.chatActive {
+			s.chatScroll = 0
+		}
+		return
+	}
+}
+
+// indexOfByte returns the index of the first occurrence of c in b, or
+// -1. Pure-Go equivalent of bytes.IndexByte; kept inline so this file
+// does not need an extra import for one call.
+func indexOfByte(b []byte, c byte) int {
+	for i, x := range b {
+		if x == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// ensureUUIDLink is a static compile-time check that the uuid import
+// is exercised; the inflightCommands map's key type pins it.
+var _ = uuid.UUID{}
 
 // handleChatPosted is the legacy ChatMessage path under the new typed
 // envelope. Materializes the event into a ui.ChatMessage and runs the

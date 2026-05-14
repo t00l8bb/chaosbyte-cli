@@ -71,6 +71,13 @@ type SurfacesConfig struct {
 	Games       bool
 	Skills      bool // planned, off by default
 	Discussions bool // planned, off by default
+
+	// Dispatcher gates the Monobyte build surface: /run, /sh, /pull,
+	// /scratch, /serve, /unserve, /agent. Vibespace ships with this
+	// off — it's a chatroom product. Monobyte rooms (and any team
+	// that opts in via their .toml) set it true to unlock the dev
+	// verbs.
+	Dispatcher bool
 }
 
 // SpotlightConfig names the currently spotlit project for this team. v1
@@ -122,6 +129,33 @@ func DefaultVibespace() RoomConfig {
 			RepoURL:     "git.sr.ht/~rin/tinytty",
 		},
 	}
+}
+
+// DefaultMonobyte returns the built-in Monobyte team configuration.
+// Same engine, same broker, same identity — but the dispatcher surface
+// (/run, /sh, /pull, /scratch, /serve, /unserve, /agent) is unlocked.
+// Users SSH `ssh monobyte@host` to land here.
+//
+// The strategic split: Vibespace is the chatroom product (community
+// wedge). Monobyte is the build product (lights up the dev verbs).
+// One server binary, two surfaces. Teams that want both rooms can
+// run both slugs.
+func DefaultMonobyte() RoomConfig {
+	cfg := DefaultVibespace()
+	cfg.Slug = "monobyte"
+	cfg.Brand = BrandConfig{
+		Name:    "monobyte",
+		MOTD:    "the build room. /run, /pull, /agent — ship together.",
+		Tagline: "where vibe coders and devs work the same canvas.",
+	}
+	cfg.Mod.Welcome = "welcome to monobyte, {nick}. /help for the verbs."
+	cfg.Surfaces = SurfacesConfig{
+		Chat:       true,
+		Spotlight:  true,
+		Games:      false,
+		Dispatcher: true,
+	}
+	return cfg
 }
 
 // MergeWithDefaults takes a partial config a team has set and fills in any

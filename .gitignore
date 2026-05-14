@@ -1,6 +1,8 @@
 /vibespace
 /vibespace-server
 /vibespace-trace
+/bin/
+/var/
 .ssh/
 
 # Secrets and per-deployment configs.

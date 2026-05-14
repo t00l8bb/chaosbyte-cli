@@ -133,6 +133,70 @@ func TestBrokerUnsubscribe(t *testing.T) {
 }
 
 // TestBrokerHLCStamping confirms events get an HLC assigned on publish.
+// TestBrokerTracksPresence confirms PresenceJoined adds an entry and
+// PresenceLeft removes it. The lobby's /who reads this.
+func TestBrokerTracksPresence(t *testing.T) {
+	b := New("vibespace", nil, nil, nil)
+	defer b.Stop()
+
+	if got := len(b.Presence()); got != 0 {
+		t.Errorf("initial presence = %d, want 0", got)
+	}
+
+	alice := events.Actor{ID: "pk:alice", DisplayName: "@alice", Kind: "human"}
+	if err := b.PublishEvent(events.NewPresenceJoined("vibespace", alice)); err != nil {
+		t.Fatal(err)
+	}
+	bob := events.Actor{ID: "pk:bob", DisplayName: "@bob", Kind: "human"}
+	if err := b.PublishEvent(events.NewPresenceJoined("vibespace", bob)); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(b.Presence()); got != 2 {
+		t.Errorf("after two joins = %d, want 2", got)
+	}
+
+	if err := b.PublishEvent(events.NewPresenceLeft("vibespace", alice, "quit")); err != nil {
+		t.Fatal(err)
+	}
+	got := b.Presence()
+	if len(got) != 1 || got[0].ID != "pk:bob" {
+		t.Errorf("after alice left = %v, want [bob]", got)
+	}
+}
+
+// TestBrokerTracksServings confirms SandboxServing adds an entry,
+// SandboxServingGone removes it, and PresenceLeft removes any
+// serving owned by the leaving actor.
+func TestBrokerTracksServings(t *testing.T) {
+	b := New("vibespace", nil, nil, nil)
+	defer b.Stop()
+
+	alice := events.Actor{ID: "pk:alice", DisplayName: "@alice", Kind: "human"}
+	bob := events.Actor{ID: "pk:bob", DisplayName: "@bob", Kind: "human"}
+	_ = b.PublishEvent(events.NewSandboxServing("vibespace", alice, alice.SessionID, "next-dev", 3000, "http"))
+	_ = b.PublishEvent(events.NewSandboxServing("vibespace", bob, bob.SessionID, "cargo-watch", 8080, "http"))
+	if got := len(b.Servings()); got != 2 {
+		t.Errorf("Servings after two serves = %d, want 2", got)
+	}
+	got, ok := b.LookupServing("pk:alice")
+	if !ok || got.Port != 3000 {
+		t.Errorf("LookupServing alice = (%+v, %v)", got, ok)
+	}
+
+	// Explicit gone.
+	_ = b.PublishEvent(events.NewSandboxServingGone("vibespace", alice, alice.SessionID, "unserve"))
+	if _, ok := b.LookupServing("pk:alice"); ok {
+		t.Error("alice serving should be gone")
+	}
+
+	// PresenceLeft also takes the serving down.
+	_ = b.PublishEvent(events.NewPresenceLeft("vibespace", bob, "quit"))
+	if _, ok := b.LookupServing("pk:bob"); ok {
+		t.Error("bob serving should be gone after PresenceLeft")
+	}
+}
+
 func TestBrokerHLCStamping(t *testing.T) {
 	b := New("vibespace", nil, nil, nil)
 	defer b.Stop()
