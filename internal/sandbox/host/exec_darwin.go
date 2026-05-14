@@ -43,8 +43,8 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 	}
 
 	profile := sbplProfile(s.dir, s.spec.Mounts)
-	args := []string{"-p", profile, cmd.Path}
-	args = append(args, cmd.Args...)
+	innerArgv := wrapWithRlimit(defaultCaps, append([]string{cmd.Path}, cmd.Args...))
+	args := append([]string{"-p", profile}, innerArgv...)
 
 	c := exec.CommandContext(ctx, "sandbox-exec", args...)
 	c.Dir = resolveWorkDir(s.dir, cmd.WorkingDir, s.spec.Mounts)

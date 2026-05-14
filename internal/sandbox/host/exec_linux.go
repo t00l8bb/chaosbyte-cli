@@ -42,8 +42,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 	}
 
 	args := bwrapArgs(s.dir, s.spec.Mounts, cmd)
-	args = append(args, cmd.Path)
-	args = append(args, cmd.Args...)
+	args = append(args, wrapWithRlimit(defaultCaps, append([]string{cmd.Path}, cmd.Args...))...)
 
 	c := exec.CommandContext(ctx, "bwrap", args...)
 	c.Env = buildEnv(s.spec.Env, cmd.Env)

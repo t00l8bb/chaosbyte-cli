@@ -192,6 +192,10 @@ func (d *Dispatcher) execute(ctx context.Context, chat *events.ChatPosted, cmd P
 		d.executePull(ctx, actor, principal, commandID, cmd.Raw)
 		return
 	}
+	if cmd.Verb == VerbScratch {
+		d.executeScratch(ctx, actor, principal, commandID, cmd.Raw)
+		return
+	}
 
 	sb, err := d.orch.Acquire(ctx, principal, sandbox.Spec{})
 	if err != nil {
@@ -262,6 +266,31 @@ func (d *Dispatcher) executePull(ctx context.Context, actor events.Actor, princi
 	_ = d.broker.PublishEvent(events.NewSandboxCommandOutput(
 		d.roomID, actor, commandID, events.StreamStdout,
 		[]byte(fmt.Sprintf("workspace switched to %s\n", path)),
+	))
+	d.publishCompleted(actor, commandID, 0, nil)
+}
+
+// executeScratch handles the /scratch verb. It reprovisions the
+// session with an EMPTY workspace (no base repo, no worktree mount)
+// so the user can hack on something from zero. The optional
+// description is surfaced back to chat but not yet wired to an agent.
+func (d *Dispatcher) executeScratch(ctx context.Context, actor events.Actor, principal identity.Principal, commandID uuid.UUID, description string) {
+	rp, ok := d.orch.(Reprovisioner)
+	if !ok {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/scratch requires a worktree controller; ask the operator to configure one"))
+		return
+	}
+	if _, err := rp.Reprovision(ctx, principal, "", ""); err != nil {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/scratch: %w", err))
+		return
+	}
+	msg := "workspace reset to empty scratch"
+	if description != "" {
+		msg += ": " + description
+	}
+	_ = d.broker.PublishEvent(events.NewSandboxCommandOutput(
+		d.roomID, actor, commandID, events.StreamStdout,
+		[]byte(msg+"\n"),
 	))
 	d.publishCompleted(actor, commandID, 0, nil)
 }

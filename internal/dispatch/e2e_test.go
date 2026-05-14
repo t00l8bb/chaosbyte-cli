@@ -330,6 +330,91 @@ func TestPullRejectsRemoteURL(t *testing.T) {
 	}
 }
 
+// TestScratchProducesEmptyWorkspace confirms the /scratch verb wipes
+// the session's workspace and leaves an empty sandbox the user can
+// hack in.
+func TestScratchProducesEmptyWorkspace(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("host sandbox only on darwin/linux, got %s", runtime.GOOS)
+	}
+	bare := setupBareRepoForDispatchTest(t)
+	rt, err := sbhost.New(t.TempDir())
+	if err != nil {
+		t.Skipf("host backend unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	wtCtrl, err := plainController(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start with a base repo configured so the first sandbox has
+	// content. /scratch then wipes it.
+	orch := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(wtCtrl, bare, "main", "/workspace")
+	b := room.New("test", nil, nil, nil)
+	defer b.Stop()
+
+	d := dispatch.New(b, orch, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = d.Start(ctx)
+	defer d.Stop()
+
+	_, obs := b.Subscribe()
+	actor := events.Actor{ID: "pk:test", DisplayName: "@d", Kind: "human", SessionID: uuid.New()}
+
+	// Confirm the seed file exists pre-scratch via /run ls.
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/run ls", ui.ChatNormal))
+	pre := drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if _, ok := e.(*events.SandboxCommandCompleted); ok {
+				return true
+			}
+		}
+		return false
+	})
+	var preBody strings.Builder
+	for _, e := range pre {
+		if v, ok := e.(*events.SandboxCommandOutput); ok && v.Stream == events.StreamStdout {
+			preBody.Write(v.Chunk)
+		}
+	}
+	if !strings.Contains(preBody.String(), "README.md") {
+		t.Fatalf("seed pre-scratch did not list README.md, got %q", preBody.String())
+	}
+
+	// /scratch
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/scratch hacking on dispatcher", ui.ChatNormal))
+	drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if c, ok := e.(*events.SandboxCommandCompleted); ok && c.ExitCode == 0 {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Post-scratch /run ls should be empty.
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/run ls -1A", ui.ChatNormal))
+	post := drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if _, ok := e.(*events.SandboxCommandCompleted); ok {
+				return true
+			}
+		}
+		return false
+	})
+	var postBody strings.Builder
+	for _, e := range post {
+		if v, ok := e.(*events.SandboxCommandOutput); ok && v.Stream == events.StreamStdout {
+			postBody.Write(v.Chunk)
+		}
+	}
+	if strings.TrimSpace(postBody.String()) != "" {
+		t.Errorf("scratch workspace should be empty; ls -1A returned %q", postBody.String())
+	}
+}
+
 // TestDispatcherSurvivesCommandPanic exercises the recover() guard:
 // even if a command goroutine panics, future commands keep working.
 func TestDispatcherSurvivesCommandPanic(t *testing.T) {

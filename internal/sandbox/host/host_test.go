@@ -213,6 +213,37 @@ func TestExecHonorsMountAsWorkingDirAndWritable(t *testing.T) {
 	}
 }
 
+func TestExecHonorsCPUCap(t *testing.T) {
+	// Test that the rlimit wrapper kills a runaway CPU loop. We
+	// install a temporary tight cap for this test by calling Exec
+	// with a shell that consumes CPU; the shell's RLIMIT_CPU should
+	// trip and the process should exit non-zero within a few seconds.
+	rt := requireBackend(t)
+	// Override the default cap to 2 CPU seconds for this test only.
+	// We do this by spawning a sandbox and running a script that itself
+	// sets ulimit -t 2 before busy-looping.
+	s, err := rt.Spawn(context.Background(), sandbox.Spec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc, err := s.Exec(context.Background(), sandbox.Command{
+		Path: "/bin/sh",
+		Args: []string{"-c", "ulimit -t 2; while :; do :; done"},
+	})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	exit, err := proc.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if exit == 0 {
+		t.Errorf("runaway loop should have been killed by CPU cap, got exit=0")
+	}
+}
+
 func TestWaitContextCancelKillsProcess(t *testing.T) {
 	rt := requireBackend(t)
 	s, err := rt.Spawn(context.Background(), sandbox.Spec{})

@@ -60,6 +60,30 @@ func TestParsePullRequiresPath(t *testing.T) {
 	}
 }
 
+func TestParseScratch(t *testing.T) {
+	cases := []struct {
+		body     string
+		wantDesc string
+	}{
+		{"/scratch", ""},
+		{"/scratch ", ""},
+		{"/scratch a quick test", "a quick test"},
+	}
+	for _, tc := range cases {
+		got, err := dispatch.Parse(tc.body)
+		if err != nil {
+			t.Errorf("Parse(%q) err: %v", tc.body, err)
+			continue
+		}
+		if got.Verb != dispatch.VerbScratch {
+			t.Errorf("Parse(%q) Verb = %q, want scratch", tc.body, got.Verb)
+		}
+		if got.Raw != tc.wantDesc {
+			t.Errorf("Parse(%q) Raw = %q, want %q", tc.body, got.Raw, tc.wantDesc)
+		}
+	}
+}
+
 func TestParseSh(t *testing.T) {
 	got, err := dispatch.Parse(`/sh echo hi | wc -l`)
 	if err != nil {

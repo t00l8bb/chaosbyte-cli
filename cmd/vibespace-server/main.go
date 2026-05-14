@@ -101,19 +101,22 @@ func main() {
 
 	registry := platform.NewRegistry(issuer, st, rt, sandbox.Spec{})
 
-	// Optional worktree provisioning: when --base-repo points at a
-	// bare git repository, each Acquire clones a fresh worktree off it
-	// and bind-mounts it into the sandbox at --mount-path. Without
-	// --base-repo, sandboxes are empty session dirs and /run still
-	// works, just without a repo to operate on.
+	// Always wire a worktree controller. With --base-repo set, every
+	// session's Acquire provisions a clone off it and bind-mounts at
+	// --mount-path. Without --base-repo, sessions start with an empty
+	// sandbox and the user can /pull <path> or /scratch to populate
+	// their workspace. The controller is needed for /pull and /scratch
+	// even when no default base repo is configured.
+	wtCtrl, err := plain.New(*worktreeRoot)
+	if err != nil {
+		log.Error("could not initialize worktree controller", "root", *worktreeRoot, "error", err)
+		os.Exit(1)
+	}
+	registry.WithWorktrees(wtCtrl, *baseRepo, *baseBranch, *mountPath)
 	if *baseRepo != "" {
-		wtCtrl, err := plain.New(*worktreeRoot)
-		if err != nil {
-			log.Error("could not initialize worktree controller", "root", *worktreeRoot, "error", err)
-			os.Exit(1)
-		}
-		registry.WithWorktrees(wtCtrl, *baseRepo, *baseBranch, *mountPath)
 		log.Info("worktree provisioning enabled", "base-repo", *baseRepo, "branch", *baseBranch, "mount", *mountPath, "root", *worktreeRoot)
+	} else {
+		log.Info("worktree controller ready; sessions start empty (users can /pull or /scratch)", "mount", *mountPath, "root", *worktreeRoot)
 	}
 	if loaded, err := config.LoadFromDir(*configsDir); err != nil {
 		log.Warn("could not read configs directory", "dir", *configsDir, "error", err)

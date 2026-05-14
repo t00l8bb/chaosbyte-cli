@@ -24,9 +24,10 @@ import (
 type Verb string
 
 const (
-	VerbRun  Verb = "run"
-	VerbSh   Verb = "sh"
-	VerbPull Verb = "pull"
+	VerbRun     Verb = "run"
+	VerbSh      Verb = "sh"
+	VerbPull    Verb = "pull"
+	VerbScratch Verb = "scratch"
 )
 
 // ParsedCommand is the structured form of a recognized slash command.
@@ -88,6 +89,14 @@ func Parse(body string) (ParsedCommand, error) {
 			Verb: VerbPull,
 			Argv: []string{path},
 			Raw:  path,
+		}, nil
+	case VerbScratch:
+		// /scratch is allowed without an argument; the optional rest is
+		// a free-form description we keep for future agent context.
+		return ParsedCommand{
+			Verb: VerbScratch,
+			Argv: []string{rest},
+			Raw:  rest,
 		}, nil
 	default:
 		return ParsedCommand{}, ErrNotACommand
