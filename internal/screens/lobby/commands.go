@@ -88,6 +88,14 @@ func (s *Screen) handleSlash(text string) (*Screen, tea.Cmd) {
 		return s.cmdMe(args)
 	case "/who":
 		return s.cmdWho()
+	case "/run", "/sh", "/pull", "/scratch", "/serve", "/unserve", "/agent":
+		// Dispatcher-side verbs: lobby does not interpret these
+		// inline. Publish the raw line as a chat message so every
+		// session sees the user invoking it, then the per-room
+		// dispatcher's Parse picks it up and runs the command in the
+		// actor's sandbox.
+		s.postUser(text)
+		return s, nil
 	}
 	s.postSystem(fmt.Sprintf("unknown command %q, try /help", parts[0]))
 	return s, nil
