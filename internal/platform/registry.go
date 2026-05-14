@@ -18,11 +18,14 @@
 package platform
 
 import (
+	"context"
 	"sync"
 
 	"github.com/bchayka/gitstatus/internal/capability"
 	"github.com/bchayka/gitstatus/internal/config"
+	"github.com/bchayka/gitstatus/internal/dispatch"
 	"github.com/bchayka/gitstatus/internal/room"
+	"github.com/bchayka/gitstatus/internal/sandbox"
 	"github.com/bchayka/gitstatus/internal/store"
 )
 
@@ -33,21 +36,37 @@ type Registry struct {
 	flagshipSlug string
 	configs      map[string]config.RoomConfig
 	brokers      map[string]*room.Broker
+	orchs        map[string]*sandbox.Orchestrator
+	dispatchers  map[string]*dispatch.Dispatcher
 	verifier     *capability.Issuer
 	store        store.Store
+	runtime      sandbox.Runtime
+	defaultSpec  sandbox.Spec
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // NewRegistry builds a registry seeded with the flagship Vibespace. The
 // flagship's slug is whatever DefaultVibespace returns ("vibespace" today).
 // Use Register to add more teams. verifier is optional; when set, every
 // per-team broker uses it for capability checks. st is optional; when set,
-// every per-team broker persists events through it.
-func NewRegistry(verifier *capability.Issuer, st store.Store) *Registry {
+// every per-team broker persists events through it. runtime is optional;
+// when set, every per-team broker also gets a sandbox.Orchestrator and a
+// dispatch.Dispatcher wired against it so /run and /sh slash commands
+// flow into real sandboxes.
+func NewRegistry(verifier *capability.Issuer, st store.Store, runtime sandbox.Runtime, defaultSpec sandbox.Spec) *Registry {
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Registry{
-		configs:  map[string]config.RoomConfig{},
-		brokers:  map[string]*room.Broker{},
-		verifier: verifier,
-		store:    st,
+		configs:     map[string]config.RoomConfig{},
+		brokers:     map[string]*room.Broker{},
+		orchs:       map[string]*sandbox.Orchestrator{},
+		dispatchers: map[string]*dispatch.Dispatcher{},
+		verifier:    verifier,
+		store:       st,
+		runtime:     runtime,
+		defaultSpec: defaultSpec,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	flagship := config.DefaultVibespace()
 	r.flagshipSlug = flagship.Slug
@@ -64,7 +83,20 @@ func (r *Registry) Register(cfg config.RoomConfig) {
 	defer r.mu.Unlock()
 	r.configs[cfg.Slug] = cfg
 	if _, ok := r.brokers[cfg.Slug]; !ok {
-		r.brokers[cfg.Slug] = room.New(cfg.Slug, nil, r.verifier, r.store)
+		broker := room.New(cfg.Slug, nil, r.verifier, r.store)
+		r.brokers[cfg.Slug] = broker
+
+		// If a sandbox runtime is configured, spin up the dispatch stack
+		// for this team. Each team gets its own Orchestrator so a
+		// session's sandbox is scoped to the room it joins.
+		if r.runtime != nil {
+			orch := sandbox.NewOrchestrator(r.runtime, r.defaultSpec)
+			r.orchs[cfg.Slug] = orch
+			d := dispatch.New(broker, orch, cfg.Slug)
+			if err := d.Start(r.ctx); err == nil {
+				r.dispatchers[cfg.Slug] = d
+			}
+		}
 	}
 }
 
@@ -92,10 +124,20 @@ func (r *Registry) Teams() []string {
 	return out
 }
 
-// Stop tears down every team's broker. Used on orderly server shutdown.
+// Stop tears down every team's broker, dispatcher, and orchestrator.
+// Used on orderly server shutdown.
 func (r *Registry) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	for _, d := range r.dispatchers {
+		d.Stop()
+	}
+	for _, o := range r.orchs {
+		_ = o.Close(context.Background())
+	}
 	for _, b := range r.brokers {
 		b.Stop()
 	}

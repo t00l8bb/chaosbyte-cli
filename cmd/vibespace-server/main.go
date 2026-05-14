@@ -28,6 +28,8 @@ import (
 	"github.com/bchayka/gitstatus/internal/config"
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/platform"
+	"github.com/bchayka/gitstatus/internal/sandbox"
+	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
 	"github.com/bchayka/gitstatus/internal/store/sqlite"
 	"github.com/bchayka/gitstatus/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
@@ -50,6 +52,7 @@ func main() {
 	keyfile := flag.String("keyfile", "configs/keys/allowlist.toml", "path to the pubkey allowlist")
 	biscuitKeyPath := flag.String("biscuit-key", "configs/keys/biscuit-root.key", "path to the biscuit root keypair (auto-generated if missing)")
 	dbPath := flag.String("db", "vibespace.db", "path to the SQLite event log")
+	sandboxRoot := flag.String("sandbox-root", "var/sandboxes", "directory under which per-session sandbox temp dirs live")
 	flag.Parse()
 
 	allowlist, err := identity.LoadAllowlist(*keyfile)
@@ -80,7 +83,17 @@ func main() {
 	defer st.Close()
 	log.Info("event log open", "path", *dbPath)
 
-	registry := platform.NewRegistry(issuer, st)
+	// Host sandbox runtime: wraps every per-session process under
+	// sandbox-exec on Darwin or bwrap on Linux. Constructed once and
+	// shared across every team's Orchestrator.
+	rt, err := sbhost.New(*sandboxRoot)
+	if err != nil {
+		log.Error("could not initialize sandbox runtime", "root", *sandboxRoot, "error", err)
+		os.Exit(1)
+	}
+	log.Info("sandbox runtime ready", "kind", rt.Kind(), "root", *sandboxRoot)
+
+	registry := platform.NewRegistry(issuer, st, rt, sandbox.Spec{})
 	if loaded, err := config.LoadFromDir(*configsDir); err != nil {
 		log.Warn("could not read configs directory", "dir", *configsDir, "error", err)
 	} else {
