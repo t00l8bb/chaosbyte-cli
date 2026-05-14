@@ -28,6 +28,8 @@ const (
 	VerbSh      Verb = "sh"
 	VerbPull    Verb = "pull"
 	VerbScratch Verb = "scratch"
+	VerbServe   Verb = "serve"
+	VerbUnserve Verb = "unserve"
 )
 
 // ParsedCommand is the structured form of a recognized slash command.
@@ -96,6 +98,24 @@ func Parse(body string) (ParsedCommand, error) {
 		return ParsedCommand{
 			Verb: VerbScratch,
 			Argv: []string{rest},
+			Raw:  rest,
+		}, nil
+	case VerbServe:
+		// /serve <port> <cmd argv...>. We require an explicit port so
+		// the proxy knows where to dial; auto-detect is a follow-up.
+		fields := splitArgv(rest)
+		if len(fields) < 2 {
+			return ParsedCommand{}, fmt.Errorf("dispatch: /serve requires a port and a command, e.g. /serve 3000 npm run dev")
+		}
+		return ParsedCommand{
+			Verb: VerbServe,
+			Argv: fields,
+			Raw:  rest,
+		}, nil
+	case VerbUnserve:
+		return ParsedCommand{
+			Verb: VerbUnserve,
+			Argv: nil,
 			Raw:  rest,
 		}, nil
 	default:

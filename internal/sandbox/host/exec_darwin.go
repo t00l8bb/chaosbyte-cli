@@ -157,7 +157,15 @@ func sbplProfile(sessionDir string, mounts []sandbox.Mount) string {
 (allow file-write*
 ` + strings.Join(writableSubpaths, "\n") + `)
 
-(deny network*)
+;; Loopback bind + inbound is allowed so a sandboxed dev server can
+;; listen on 127.0.0.1:<port> and accept requests from the host's
+;; HTTP proxy. Restricted to loopback specifically so a sandboxed
+;; process cannot bind 0.0.0.0 and reach the network. Outbound stays
+;; denied so the dev server cannot phone home or scrape arbitrary
+;; URLs.
+(allow network-bind     (local ip "localhost:*"))
+(allow network-inbound  (local ip "localhost:*"))
+(deny  network-outbound)
 `
 }
 

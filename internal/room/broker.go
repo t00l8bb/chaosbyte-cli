@@ -70,6 +70,21 @@ type Broker struct {
 	// Updated as PresenceJoined / PresenceLeft events flow through
 	// PublishEvent. Read by callers via Presence().
 	presence map[string]events.Actor
+
+	// servings tracks active dev-server listens, keyed by Actor.ID.
+	// Updated as SandboxServing / SandboxServingGone flow through.
+	// Read by callers via Servings().
+	servings map[string]Serving
+}
+
+// Serving is one active dev-server listen as seen by the room. The
+// contributor strip in monobyte-osx renders one chip per Serving.
+type Serving struct {
+	Actor  events.Actor
+	Label  string
+	Port   int
+	Scheme string
+	Since  time.Time
 }
 
 // activityWindow is the lookback the tier classifier uses on publish times.
@@ -109,6 +124,7 @@ func New(roomID string, clock *events.Clock, verifier *capability.Issuer, st sto
 			SessionID:   uuid.Nil,
 		},
 		presence: map[string]events.Actor{},
+		servings: map[string]Serving{},
 	}
 	for ch, msgs := range seedMessages() {
 		b.messages[ch] = msgs
@@ -175,6 +191,29 @@ func (b *Broker) Presence() []events.Actor {
 		out = append(out, a)
 	}
 	return out
+}
+
+// Servings returns the currently-active dev-server listens in the
+// room. The contributor strip in monobyte-osx renders one chip per
+// entry. Order is not guaranteed.
+func (b *Broker) Servings() []Serving {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]Serving, 0, len(b.servings))
+	for _, s := range b.servings {
+		out = append(out, s)
+	}
+	return out
+}
+
+// LookupServing returns the active serving for a given actor id, or
+// false if no such serving exists. Used by the HTTP proxy to resolve
+// /u/<actorID> → 127.0.0.1:<port>.
+func (b *Broker) LookupServing(actorID string) (Serving, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.servings[actorID]
+	return s, ok
 }
 
 // Snapshot returns a copy of the channel's scrollback. Callers can
@@ -277,6 +316,22 @@ func (b *Broker) PublishEvent(evt events.Event) error {
 	case *events.PresenceLeft:
 		b.mu.Lock()
 		delete(b.presence, p.Actor.ID)
+		// Servings die with the session that hosted them.
+		delete(b.servings, p.Actor.ID)
+		b.mu.Unlock()
+	case *events.SandboxServing:
+		b.mu.Lock()
+		b.servings[p.Actor.ID] = Serving{
+			Actor:  p.Actor,
+			Label:  p.Label,
+			Port:   p.Port,
+			Scheme: p.Scheme,
+			Since:  time.Now(),
+		}
+		b.mu.Unlock()
+	case *events.SandboxServingGone:
+		b.mu.Lock()
+		delete(b.servings, p.Actor.ID)
 		b.mu.Unlock()
 	}
 

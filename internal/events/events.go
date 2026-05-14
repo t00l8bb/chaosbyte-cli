@@ -197,6 +197,18 @@ func Unmarshal(data []byte) (Event, error) {
 			return nil, fmt.Errorf("events: unmarshal sandbox.command.completed payload: %w", err)
 		}
 		return &SandboxCommandCompleted{Header: h, CommandID: p.CommandID, ExitCode: p.ExitCode, Error: p.Error}, nil
+	case kindSandboxServing:
+		var p sandboxServingPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.serving payload: %w", err)
+		}
+		return &SandboxServing{Header: h, UserSessionID: p.UserSessionID, Label: p.Label, Port: p.Port, Scheme: p.Scheme}, nil
+	case kindSandboxServingGone:
+		var p sandboxServingGonePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, fmt.Errorf("events: unmarshal sandbox.serving.gone payload: %w", err)
+		}
+		return &SandboxServingGone{Header: h, UserSessionID: p.UserSessionID, Reason: p.Reason}, nil
 	default:
 		return &Unknown{Header: h, Kind_: env.Kind, RawPayload: env.Payload}, nil
 	}

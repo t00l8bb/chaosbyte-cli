@@ -139,6 +139,21 @@ func (r *Registry) Resolve(slug string) (config.RoomConfig, *room.Broker) {
 	return r.configs[r.flagshipSlug], r.brokers[r.flagshipSlug]
 }
 
+// LookupServingByActor returns the active dev-server Serving for the
+// given actor id across every registered team. Returns (zero, false)
+// if no team has a serving for that id. Used by the HTTP proxy to
+// route /u/<actorID>/* to the right sandbox port.
+func (r *Registry) LookupServingByActor(actorID string) (room.Serving, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, b := range r.brokers {
+		if s, ok := b.LookupServing(actorID); ok {
+			return s, true
+		}
+	}
+	return room.Serving{}, false
+}
+
 // Teams returns the registered slugs in no particular order. Used by the
 // provisioning surface and by admin tools.
 func (r *Registry) Teams() []string {

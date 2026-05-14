@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -58,15 +59,30 @@ type Dispatcher struct {
 	subID   room.SubscriberID
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
+
+	// servings holds the dev-server process per actor (keyed by
+	// Actor.ID). /serve registers an entry; /unserve, PresenceLeft,
+	// or the process exiting clears it.
+	servings map[string]*serving
+}
+
+// serving bundles the live dev-server process with the cancel
+// function that kills it.
+type serving struct {
+	proc   sandbox.Process
+	cancel context.CancelFunc
+	port   int
+	label  string
 }
 
 // New returns a Dispatcher for the given room scope.
 func New(broker Broker, orch Orchestrator, roomID string) *Dispatcher {
 	return &Dispatcher{
-		broker: broker,
-		orch:   orch,
-		roomID: roomID,
-		stopCh: make(chan struct{}),
+		broker:   broker,
+		orch:     orch,
+		roomID:   roomID,
+		stopCh:   make(chan struct{}),
+		servings: map[string]*serving{},
 	}
 }
 
@@ -125,8 +141,10 @@ func (d *Dispatcher) loop(ctx context.Context, ch <-chan events.Event) {
 				go d.executeSafe(ctx, e, parsed)
 			case *events.PresenceLeft:
 				// Session ended (quit, disconnect, kicked, stalled).
-				// Release the actor's sandbox + worktree so they do
-				// not leak. Best-effort; we ignore the error.
+				// Stop any /serve they had running, then release the
+				// actor's sandbox + worktree so they do not leak.
+				// Best-effort; we ignore the error.
+				d.stopServing(ctx, e.Actor.ID, "disconnect")
 				p := identity.Principal{
 					ID:          e.Actor.ID,
 					DisplayName: e.Actor.DisplayName,
@@ -194,6 +212,14 @@ func (d *Dispatcher) execute(ctx context.Context, chat *events.ChatPosted, cmd P
 	}
 	if cmd.Verb == VerbScratch {
 		d.executeScratch(ctx, actor, principal, commandID, cmd.Raw)
+		return
+	}
+	if cmd.Verb == VerbServe {
+		d.executeServe(ctx, actor, principal, commandID, cmd.Argv)
+		return
+	}
+	if cmd.Verb == VerbUnserve {
+		d.executeUnserve(ctx, actor, commandID)
 		return
 	}
 
@@ -293,6 +319,133 @@ func (d *Dispatcher) executeScratch(ctx context.Context, actor events.Actor, pri
 		[]byte(msg+"\n"),
 	))
 	d.publishCompleted(actor, commandID, 0, nil)
+}
+
+// executeServe starts a long-running dev server inside the actor's
+// sandbox. argv = ["<port>", "<bin>", "<arg1>", ...]. The first token
+// is the port the dev server binds to (we trust the user; auto-detect
+// is follow-up work). The port is exported as PORT in the process
+// env so frameworks that respect it (Next, Rails, Sinatra) pick it up.
+//
+// On success we publish SandboxServing for the broker and contributor
+// strips, store a handle on the Dispatcher so /unserve and
+// PresenceLeft can stop it, and emit a Completed event so the lobby
+// renders an "@actor served port X" card. The process continues to
+// run; its stdout/stderr stream to chat as SandboxCommandOutput
+// frames just like /run.
+func (d *Dispatcher) executeServe(ctx context.Context, actor events.Actor, principal identity.Principal, commandID uuid.UUID, argv []string) {
+	if len(argv) < 2 {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/serve requires a port and a command"))
+		return
+	}
+	port, err := strconv.Atoi(argv[0])
+	if err != nil || port <= 0 || port > 65535 {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/serve: invalid port %q", argv[0]))
+		return
+	}
+	cmdArgv := argv[1:]
+
+	// One serving per actor. Stop any existing one first so /serve
+	// twice rotates cleanly.
+	d.stopServing(ctx, actor.ID, "replaced")
+
+	sb, err := d.orch.Acquire(ctx, principal, sandbox.Spec{})
+	if err != nil {
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/serve: acquire sandbox: %w", err))
+		return
+	}
+
+	// Independent ctx so the serve process is NOT canceled when the
+	// /serve command's invocation ctx returns. Bound to the dispatcher
+	// lifetime via stopCh below.
+	serveCtx, cancel := context.WithCancel(context.Background())
+
+	proc, err := sb.Exec(serveCtx, sandbox.Command{
+		Path: cmdArgv[0],
+		Args: cmdArgv[1:],
+		Env: map[string]string{
+			"PORT": argv[0],
+			"HOST": "127.0.0.1",
+		},
+	})
+	if err != nil {
+		cancel()
+		d.publishCompleted(actor, commandID, -1, fmt.Errorf("/serve: exec: %w", err))
+		return
+	}
+
+	label := strings.Join(cmdArgv, " ")
+	d.mu.Lock()
+	d.servings[actor.ID] = &serving{proc: proc, cancel: cancel, port: port, label: label}
+	d.mu.Unlock()
+
+	// Stream stdout/stderr to chat just like a /run, plus emit
+	// SandboxServing so the contributor strip lights up immediately.
+	go d.pump(actor, commandID, events.StreamStdout, proc.Stdout())
+	go d.pump(actor, commandID, events.StreamStderr, proc.Stderr())
+	_ = d.broker.PublishEvent(events.NewSandboxServing(d.roomID, actor, actor.SessionID, label, port, "http"))
+
+	// Watch for the dev server exiting on its own. Clean up state and
+	// publish ServingGone so the room knows the port is no longer
+	// available.
+	go func() {
+		exit, _ := proc.Wait(serveCtx)
+		d.mu.Lock()
+		current, ok := d.servings[actor.ID]
+		if ok && current.proc == proc {
+			delete(d.servings, actor.ID)
+		}
+		d.mu.Unlock()
+		reason := fmt.Sprintf("exit %d", exit)
+		_ = d.broker.PublishEvent(events.NewSandboxServingGone(d.roomID, actor, actor.SessionID, reason))
+		_ = d.broker.PublishEvent(events.NewSandboxCommandCompleted(d.roomID, actor, commandID, exit, ""))
+	}()
+
+	// Publish an "issued summary" stdout frame so the lobby shows
+	// "serving on port N" right under the issued card.
+	_ = d.broker.PublishEvent(events.NewSandboxCommandOutput(
+		d.roomID, actor, commandID, events.StreamStdout,
+		[]byte(fmt.Sprintf("serving %s on http://127.0.0.1:%d\n", label, port)),
+	))
+}
+
+// executeUnserve stops the actor's currently-running serving, if
+// any. Posts a Completed event regardless of whether anything was
+// running so the lobby shows confirmation.
+func (d *Dispatcher) executeUnserve(ctx context.Context, actor events.Actor, commandID uuid.UUID) {
+	stopped := d.stopServing(ctx, actor.ID, "unserve")
+	if stopped {
+		_ = d.broker.PublishEvent(events.NewSandboxCommandOutput(
+			d.roomID, actor, commandID, events.StreamStdout,
+			[]byte("serving stopped\n"),
+		))
+	} else {
+		_ = d.broker.PublishEvent(events.NewSandboxCommandOutput(
+			d.roomID, actor, commandID, events.StreamStdout,
+			[]byte("nothing was serving\n"),
+		))
+	}
+	d.publishCompleted(actor, commandID, 0, nil)
+}
+
+// stopServing kills the actor's serving, if any, and publishes
+// SandboxServingGone. Returns true if a serving was running.
+func (d *Dispatcher) stopServing(ctx context.Context, actorID, reason string) bool {
+	d.mu.Lock()
+	s, ok := d.servings[actorID]
+	if ok {
+		delete(d.servings, actorID)
+	}
+	d.mu.Unlock()
+	if !ok {
+		return false
+	}
+	s.cancel()
+	_ = s.proc.Signal(sandbox.SignalTerm)
+	// Best effort: give it a moment to exit cleanly, then move on.
+	// The goroutine started in executeServe will publish the
+	// ServingGone via the natural exit path.
+	return true
 }
 
 // isURL is a coarse predicate for "looks like a remote URL." Used by

@@ -29,6 +29,7 @@ import (
 	"github.com/bchayka/gitstatus/internal/events"
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/platform"
+	"github.com/bchayka/gitstatus/internal/proxy"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
 	"github.com/bchayka/gitstatus/internal/worktree/plain"
@@ -59,6 +60,7 @@ func main() {
 	baseRepo := flag.String("base-repo", "", "absolute path to a bare git repo; each session gets a worktree clone of it mounted into the sandbox (empty = no worktree provisioning)")
 	baseBranch := flag.String("base-branch", "", "branch to check out for new worktrees (empty = HEAD)")
 	mountPath := flag.String("mount-path", "/workspace", "path inside the sandbox where the worktree is bind-mounted")
+	proxyAddr := flag.String("proxy-addr", "127.0.0.1:23291", "listen address for the HTTP proxy that fronts /serve dev servers (empty = disabled)")
 	flag.Parse()
 
 	allowlist, err := identity.LoadAllowlist(*keyfile)
@@ -145,6 +147,20 @@ func main() {
 	if err != nil {
 		log.Error("could not start server", "error", err)
 		os.Exit(1)
+	}
+
+	// Optional HTTP reverse proxy that fronts /serve dev servers. The
+	// proxy listens on its own address; URL shape is
+	// /u/<actorID>/<path>. Disabled if --proxy-addr is empty.
+	var proxySrv *proxy.Server
+	if *proxyAddr != "" {
+		proxySrv = proxy.New(*proxyAddr, registry)
+		if err := proxySrv.Start(); err != nil {
+			log.Error("could not start HTTP proxy", "addr", *proxyAddr, "error", err)
+			os.Exit(1)
+		}
+		log.Info("HTTP proxy ready", "addr", *proxyAddr)
+		defer proxySrv.Close()
 	}
 
 	done := make(chan os.Signal, 1)
