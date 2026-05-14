@@ -1,11 +1,11 @@
 // Package mock is the in-process Runtime used by unit tests. It does
 // not isolate; commands run in the same process as the caller via a
 // fake exec model. The mock is permanent: it lives in the codebase as
-// the unit-test substrate so we never have to spin up Firecracker to
-// exercise the orchestrator.
+// the unit-test substrate so we never need to spin up a real backend
+// to exercise the orchestrator.
 //
-// Production code paths never see mock. The Firecracker backend is
-// the only Runtime the daemon constructs in cmd/vibespace-server.
+// Production code paths never see mock. The host backend (sandbox-exec
+// on Darwin, bwrap on Linux) is what cmd/vibespace-server constructs.
 package mock
 
 import (

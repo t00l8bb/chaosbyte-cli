@@ -7,15 +7,15 @@
 //
 //   - Runtime: a backend factory that knows how to spawn and destroy
 //     sandboxes on the host. Phase 2 ships two implementations:
-//     mock (in-process, for tests) and firecracker (Linux microVMs,
-//     production).
+//     mock (in-process, for tests) and host (OS-native process
+//     isolation via sandbox-exec on Darwin and bwrap on Linux).
 //   - Sandbox: a single live instance. Exec runs commands inside it,
 //     PTY returns a pseudo-terminal, Wait blocks until the process
 //     ends, Destroy tears it down.
 //
-// The Phase 1 design called for Firecracker as the only production
-// backend. The mock implementation lives in the codebase permanently
-// for unit tests; it is not a v0.1 development shortcut.
+// A future Firecracker backend can drop into the same Runtime
+// interface for stronger isolation against untrusted tenants. The mock
+// implementation lives in the codebase permanently for unit tests.
 package sandbox
 
 import (
@@ -36,9 +36,10 @@ func (id ID) String() string { return uuid.UUID(id).String() }
 // Spec describes the sandbox a caller wants. The Runtime picks a
 // concrete instance whose fields match.
 type Spec struct {
-	// Image is the rootfs identifier. For firecracker this is a
-	// snapshot name from the warm pool; for mock it is a free-form
-	// label.
+	// Image is the rootfs identifier. For host the field is purely
+	// informational. For mock it is a free-form label. A future
+	// firecracker backend would resolve it to a snapshot in the warm
+	// pool.
 	Image string
 
 	// CPU is the requested vCPU count. The runtime may round up if the
@@ -51,8 +52,10 @@ type Spec struct {
 	// Env is the environment variables to set inside the sandbox.
 	Env map[string]string
 
-	// Mounts is the set of host->sandbox bind mounts. For firecracker
-	// these become virtio-fs mounts; for mock they are no-ops.
+	// Mounts is the set of host->sandbox bind mounts. For host on Linux
+	// these become extra --bind / --ro-bind flags into bwrap; on Darwin
+	// they are noted in the SBPL profile as additional file-write*
+	// subpaths. For mock they are no-ops.
 	Mounts []Mount
 
 	// MaxLifetime caps how long the sandbox may live before automatic
@@ -81,8 +84,8 @@ type Runtime interface {
 	// ErrRuntimeClosed.
 	Close() error
 
-	// Kind identifies the backend ("mock", "firecracker") for logs
-	// and metrics.
+	// Kind identifies the backend ("mock", "host", future
+	// "firecracker") for logs and metrics.
 	Kind() string
 }
 
