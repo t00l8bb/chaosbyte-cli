@@ -238,6 +238,19 @@ func handlerFor(reg *platform.Registry, allowlist *identity.Allowlist, issuer *c
 			BorderLo: cfg.Theme.BorderLo,
 		})
 
+		// Broadcast that this session joined so /who and any future
+		// presence panes know the user is here. Mirrored by the
+		// goroutine below that fires PresenceLeft on disconnect.
+		if broker != nil {
+			actor := events.Actor{
+				ID:          principal.ID,
+				DisplayName: principal.DisplayName,
+				Kind:        principal.Kind.String(),
+				SessionID:   principal.SessionID,
+			}
+			_ = broker.PublishEvent(events.NewPresenceJoined(slug, actor))
+		}
+
 		// Watch the SSH session for end-of-life so we can publish a
 		// PresenceLeft on the broker. The dispatcher subscribes to
 		// PresenceLeft to release the sandbox + worktree. Without this

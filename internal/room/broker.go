@@ -65,6 +65,11 @@ type Broker struct {
 
 	// modActor is the canonical Actor used by mod-originated events.
 	modActor events.Actor
+
+	// presence tracks who is in the room right now, keyed by Actor.ID.
+	// Updated as PresenceJoined / PresenceLeft events flow through
+	// PublishEvent. Read by callers via Presence().
+	presence map[string]events.Actor
 }
 
 // activityWindow is the lookback the tier classifier uses on publish times.
@@ -103,6 +108,7 @@ func New(roomID string, clock *events.Clock, verifier *capability.Issuer, st sto
 			Kind:        "agent",
 			SessionID:   uuid.Nil,
 		},
+		presence: map[string]events.Actor{},
 	}
 	for ch, msgs := range seedMessages() {
 		b.messages[ch] = msgs
@@ -156,6 +162,19 @@ func (b *Broker) runMod() {
 			}
 		}
 	}
+}
+
+// Presence returns the list of actors currently in the room. The
+// slice is a copy; callers can iterate without holding the broker
+// lock. Order is not guaranteed.
+func (b *Broker) Presence() []events.Actor {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]events.Actor, 0, len(b.presence))
+	for _, a := range b.presence {
+		out = append(out, a)
+	}
+	return out
 }
 
 // Snapshot returns a copy of the channel's scrollback. Callers can
@@ -246,6 +265,19 @@ func (b *Broker) PublishEvent(evt events.Event) error {
 	// Snapshot callers continue to see the latest scrollback.
 	if chat, ok := evt.(*events.ChatPosted); ok {
 		b.appendChat(chat)
+	}
+
+	// Track presence so /who and future presence panes can read it
+	// without each subscriber maintaining its own copy.
+	switch p := evt.(type) {
+	case *events.PresenceJoined:
+		b.mu.Lock()
+		b.presence[p.Actor.ID] = p.Actor
+		b.mu.Unlock()
+	case *events.PresenceLeft:
+		b.mu.Lock()
+		delete(b.presence, p.Actor.ID)
+		b.mu.Unlock()
 	}
 
 	b.mu.Lock()

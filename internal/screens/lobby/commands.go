@@ -194,7 +194,27 @@ func (s *Screen) cmdWho() (*Screen, tea.Cmd) {
 	if ch == nil {
 		return s, nil
 	}
-	s.postSystem("here right now: @yamlhater @nullpointer @devops_bard @junior_dev @standup_ghost @vibe_master @ai_grifter @senior_intern @recovering_pm @borrow_checker @boggy")
+	if s.broker == nil {
+		s.postSystem("here right now: " + s.nick + " (local)")
+		return s, nil
+	}
+	actors := s.broker.Presence()
+	if len(actors) == 0 {
+		s.postSystem("nobody here yet but you. type something so others see you arrived.")
+		return s, nil
+	}
+	names := make([]string, 0, len(actors))
+	for _, a := range actors {
+		if a.DisplayName == "" {
+			continue
+		}
+		names = append(names, a.DisplayName)
+	}
+	if len(names) == 0 {
+		s.postSystem("here right now: (no display names)")
+		return s, nil
+	}
+	s.postSystem("here right now: " + strings.Join(names, " "))
 	return s, nil
 }
 

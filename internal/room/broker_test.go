@@ -133,6 +133,38 @@ func TestBrokerUnsubscribe(t *testing.T) {
 }
 
 // TestBrokerHLCStamping confirms events get an HLC assigned on publish.
+// TestBrokerTracksPresence confirms PresenceJoined adds an entry and
+// PresenceLeft removes it. The lobby's /who reads this.
+func TestBrokerTracksPresence(t *testing.T) {
+	b := New("vibespace", nil, nil, nil)
+	defer b.Stop()
+
+	if got := len(b.Presence()); got != 0 {
+		t.Errorf("initial presence = %d, want 0", got)
+	}
+
+	alice := events.Actor{ID: "pk:alice", DisplayName: "@alice", Kind: "human"}
+	if err := b.PublishEvent(events.NewPresenceJoined("vibespace", alice)); err != nil {
+		t.Fatal(err)
+	}
+	bob := events.Actor{ID: "pk:bob", DisplayName: "@bob", Kind: "human"}
+	if err := b.PublishEvent(events.NewPresenceJoined("vibespace", bob)); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(b.Presence()); got != 2 {
+		t.Errorf("after two joins = %d, want 2", got)
+	}
+
+	if err := b.PublishEvent(events.NewPresenceLeft("vibespace", alice, "quit")); err != nil {
+		t.Fatal(err)
+	}
+	got := b.Presence()
+	if len(got) != 1 || got[0].ID != "pk:bob" {
+		t.Errorf("after alice left = %v, want [bob]", got)
+	}
+}
+
 func TestBrokerHLCStamping(t *testing.T) {
 	b := New("vibespace", nil, nil, nil)
 	defer b.Stop()
