@@ -27,6 +27,7 @@ import (
 	"github.com/bchayka/gitstatus/internal/room"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	"github.com/bchayka/gitstatus/internal/store"
+	"github.com/bchayka/gitstatus/internal/worktree"
 )
 
 // Registry holds the active set of teams and routes incoming connections
@@ -42,6 +43,10 @@ type Registry struct {
 	store        store.Store
 	runtime      sandbox.Runtime
 	defaultSpec  sandbox.Spec
+	worktrees    worktree.Controller
+	baseRepo     string
+	branch       string
+	mountPath    string
 	ctx          context.Context
 	cancel       context.CancelFunc
 }
@@ -74,6 +79,25 @@ func NewRegistry(verifier *capability.Issuer, st store.Store, runtime sandbox.Ru
 	return r
 }
 
+// WithWorktrees configures the Registry's per-team Orchestrators to
+// provision a worktree per Acquire from baseRepo, mounted at
+// mountPath. Must be called before Register if it should affect the
+// flagship; subsequent Register calls also pick it up.
+func (r *Registry) WithWorktrees(ctrl worktree.Controller, baseRepo, branch, mountPath string) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.worktrees = ctrl
+	r.baseRepo = baseRepo
+	r.branch = branch
+	r.mountPath = mountPath
+	// Apply to any orchestrators that already exist (only the flagship
+	// at this point in practice).
+	for _, o := range r.orchs {
+		o.WithWorktrees(ctrl, baseRepo, branch, mountPath)
+	}
+	return r
+}
+
 // Register adds a team or replaces an existing one. If the team is new, a
 // broker is spun up for it. Re-registering an existing team keeps its
 // broker alive so connected users do not see their room reset.
@@ -91,6 +115,9 @@ func (r *Registry) Register(cfg config.RoomConfig) {
 		// session's sandbox is scoped to the room it joins.
 		if r.runtime != nil {
 			orch := sandbox.NewOrchestrator(r.runtime, r.defaultSpec)
+			if r.worktrees != nil && r.baseRepo != "" {
+				orch.WithWorktrees(r.worktrees, r.baseRepo, r.branch, r.mountPath)
+			}
 			r.orchs[cfg.Slug] = orch
 			d := dispatch.New(broker, orch, cfg.Slug)
 			if err := d.Start(r.ctx); err == nil {

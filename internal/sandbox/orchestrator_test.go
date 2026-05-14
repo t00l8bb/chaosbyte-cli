@@ -2,6 +2,9 @@ package sandbox_test
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	"github.com/bchayka/gitstatus/internal/identity"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	"github.com/bchayka/gitstatus/internal/sandbox/mock"
+	"github.com/bchayka/gitstatus/internal/worktree/plain"
 )
 
 func samplePrincipal() identity.Principal {
@@ -144,6 +148,95 @@ func TestMergeSpecOverrides(t *testing.T) {
 	// indirectly: an Acquire with a different SessionID + different
 	// override returns a different sandbox.
 	_ = s
+}
+
+// setupBareRepo creates a bare git repo seeded with one commit. Used
+// by the worktree-mount tests below.
+func setupBareRepo(t *testing.T) string {
+	t.Helper()
+	work := t.TempDir()
+	run := func(dir, name string, args ...string) {
+		cmd := exec.Command(name, args...)
+		if dir != "" {
+			cmd.Dir = dir
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, string(out))
+		}
+	}
+	run(work, "git", "init", "-q", "-b", "main")
+	run(work, "git", "config", "user.name", "test")
+	run(work, "git", "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(work, "git", "add", "README.md")
+	run(work, "git", "commit", "-q", "-m", "initial")
+
+	bare := filepath.Join(t.TempDir(), "repo.git")
+	run("", "git", "clone", "--bare", work, bare)
+	return bare
+}
+
+func TestAcquireProvisionsWorktreeAndAttachesMount(t *testing.T) {
+	bare := setupBareRepo(t)
+	ctrl, err := plain.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := mock.New()
+	o := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(ctrl, bare, "main", "/workspace")
+	defer o.Close(context.Background())
+
+	p := samplePrincipal()
+	s, err := o.Acquire(context.Background(), p, sandbox.Spec{})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if s == nil {
+		t.Fatal("nil sandbox")
+	}
+	// The mock runtime records its last Spec via the spawned sandbox;
+	// inspect Live to confirm one session is bound.
+	if got := o.Live(); got != 1 {
+		t.Errorf("Live = %d, want 1", got)
+	}
+}
+
+func TestReleaseDestroysWorktreeAlongsideSandbox(t *testing.T) {
+	bare := setupBareRepo(t)
+	root := t.TempDir()
+	ctrl, err := plain.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := mock.New()
+	o := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(ctrl, bare, "main", "/workspace")
+
+	p := samplePrincipal()
+	if _, err := o.Acquire(context.Background(), p, sandbox.Spec{}); err != nil {
+		t.Fatal(err)
+	}
+	// Find the provisioned worktree dir under root (plain backend
+	// creates exactly one entry).
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 1 {
+		t.Fatalf("expected one worktree dir under %s, got %d", root, len(entries))
+	}
+	wtPath := filepath.Join(root, entries[0].Name())
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("worktree dir should exist: %v", err)
+	}
+
+	if err := o.Release(context.Background(), p); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be gone after Release, got err=%v", err)
+	}
 }
 
 func TestExecAndWait(t *testing.T) {

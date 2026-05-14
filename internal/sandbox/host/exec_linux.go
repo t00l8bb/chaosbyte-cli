@@ -41,7 +41,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 		return nil, errors.New("host sandbox: cmd.Path is required")
 	}
 
-	args := bwrapArgs(s.dir, cmd)
+	args := bwrapArgs(s.dir, s.spec.Mounts, cmd)
 	args = append(args, cmd.Path)
 	args = append(args, cmd.Args...)
 
@@ -101,17 +101,17 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 }
 
 // bwrapArgs returns the argv prefix for bwrap that fences a session.
-func bwrapArgs(sessionDir string, cmd sandbox.Command) []string {
-	workdir := "/workspace"
-	if cmd.WorkingDir != "" {
-		workdir = cmd.WorkingDir
-	}
-	return []string{
+// The session dir is bound at /session; each Spec.Mount is bound at
+// its SandboxPath (read-only or read-write per Mount.ReadOnly). If at
+// least one writable mount exists, its SandboxPath becomes the
+// default working dir; otherwise we land in /session.
+func bwrapArgs(sessionDir string, mounts []sandbox.Mount, cmd sandbox.Command) []string {
+	args := []string{
 		"--unshare-all",
 		"--share-net=no",
 		"--die-with-parent",
 		"--new-session",
-		"--bind", sessionDir, "/workspace",
+		"--bind", sessionDir, "/session",
 		"--ro-bind", "/usr", "/usr",
 		"--ro-bind-try", "/bin", "/bin",
 		"--ro-bind-try", "/sbin", "/sbin",
@@ -122,8 +122,29 @@ func bwrapArgs(sessionDir string, cmd sandbox.Command) []string {
 		"--proc", "/proc",
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
-		"--chdir", workdir,
 	}
+
+	defaultWorkdir := "/session"
+	for _, m := range mounts {
+		if m.HostPath == "" || m.SandboxPath == "" {
+			continue
+		}
+		if m.ReadOnly {
+			args = append(args, "--ro-bind", m.HostPath, m.SandboxPath)
+		} else {
+			args = append(args, "--bind", m.HostPath, m.SandboxPath)
+			if defaultWorkdir == "/session" {
+				defaultWorkdir = m.SandboxPath
+			}
+		}
+	}
+
+	workdir := defaultWorkdir
+	if cmd.WorkingDir != "" {
+		workdir = cmd.WorkingDir
+	}
+	args = append(args, "--chdir", workdir)
+	return args
 }
 
 // buildEnv merges spec-level and command-level env, then prepends a

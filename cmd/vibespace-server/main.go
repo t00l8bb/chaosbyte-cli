@@ -30,6 +30,7 @@ import (
 	"github.com/bchayka/gitstatus/internal/platform"
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
+	"github.com/bchayka/gitstatus/internal/worktree/plain"
 	"github.com/bchayka/gitstatus/internal/store/sqlite"
 	"github.com/bchayka/gitstatus/internal/theme"
 	tea "github.com/charmbracelet/bubbletea"
@@ -53,6 +54,10 @@ func main() {
 	biscuitKeyPath := flag.String("biscuit-key", "configs/keys/biscuit-root.key", "path to the biscuit root keypair (auto-generated if missing)")
 	dbPath := flag.String("db", "vibespace.db", "path to the SQLite event log")
 	sandboxRoot := flag.String("sandbox-root", "var/sandboxes", "directory under which per-session sandbox temp dirs live")
+	worktreeRoot := flag.String("worktree-root", "var/worktrees", "directory under which per-session worktrees live")
+	baseRepo := flag.String("base-repo", "", "absolute path to a bare git repo; each session gets a worktree clone of it mounted into the sandbox (empty = no worktree provisioning)")
+	baseBranch := flag.String("base-branch", "", "branch to check out for new worktrees (empty = HEAD)")
+	mountPath := flag.String("mount-path", "/workspace", "path inside the sandbox where the worktree is bind-mounted")
 	flag.Parse()
 
 	allowlist, err := identity.LoadAllowlist(*keyfile)
@@ -94,6 +99,21 @@ func main() {
 	log.Info("sandbox runtime ready", "kind", rt.Kind(), "root", *sandboxRoot)
 
 	registry := platform.NewRegistry(issuer, st, rt, sandbox.Spec{})
+
+	// Optional worktree provisioning: when --base-repo points at a
+	// bare git repository, each Acquire clones a fresh worktree off it
+	// and bind-mounts it into the sandbox at --mount-path. Without
+	// --base-repo, sandboxes are empty session dirs and /run still
+	// works, just without a repo to operate on.
+	if *baseRepo != "" {
+		wtCtrl, err := plain.New(*worktreeRoot)
+		if err != nil {
+			log.Error("could not initialize worktree controller", "root", *worktreeRoot, "error", err)
+			os.Exit(1)
+		}
+		registry.WithWorktrees(wtCtrl, *baseRepo, *baseBranch, *mountPath)
+		log.Info("worktree provisioning enabled", "base-repo", *baseRepo, "branch", *baseBranch, "mount", *mountPath, "root", *worktreeRoot)
+	}
 	if loaded, err := config.LoadFromDir(*configsDir); err != nil {
 		log.Warn("could not read configs directory", "dir", *configsDir, "error", err)
 	} else {

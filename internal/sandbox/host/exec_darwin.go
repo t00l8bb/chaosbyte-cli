@@ -42,12 +42,12 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 		return nil, errors.New("host sandbox: cmd.Path is required")
 	}
 
-	profile := sbplProfile(s.dir)
+	profile := sbplProfile(s.dir, s.spec.Mounts)
 	args := []string{"-p", profile, cmd.Path}
 	args = append(args, cmd.Args...)
 
 	c := exec.CommandContext(ctx, "sandbox-exec", args...)
-	c.Dir = resolveWorkDir(s.dir, cmd.WorkingDir)
+	c.Dir = resolveWorkDir(s.dir, cmd.WorkingDir, s.spec.Mounts)
 	c.Env = buildEnv(s.spec.Env, cmd.Env)
 
 	p := &Process{cmd: c}
@@ -105,7 +105,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 }
 
 // sbplProfile returns the sandbox-exec profile (SBPL) that fences a
-// process to the session directory.
+// process to the session directory and any extra Spec.Mounts.
 //
 // The profile is written as a Scheme-style s-expression. The notable
 // rules:
@@ -116,13 +116,29 @@ func (s *Sandbox) Exec(ctx context.Context, cmd sandbox.Command) (sandbox.Proces
 //   - allow file-read*		: read access to the whole host
 //     filesystem so /usr/bin/clang, /etc/resolv.conf, dylibs, etc.
 //     all resolve normally
-//   - allow file-write*	: write access limited to the session tempdir
-//     plus a small allowlist of paths Go, the shell, and friends need
-//     for their own scratch state
+//   - allow file-write*	: write access limited to the session tempdir,
+//     each writable mount, plus a small allowlist of paths Go, the
+//     shell, and friends need for their own scratch state
 //   - allow mach-lookup		: macOS services lookup
 //   - deny network*		: hard network-deny
-func sbplProfile(sessionDir string) string {
+func sbplProfile(sessionDir string, mounts []sandbox.Mount) string {
 	q := func(s string) string { return strings.ReplaceAll(s, `"`, `\"`) }
+
+	var writableSubpaths []string
+	writableSubpaths = append(writableSubpaths, `  (subpath "`+q(sessionDir)+`")`)
+	for _, m := range mounts {
+		if m.ReadOnly || m.HostPath == "" {
+			continue
+		}
+		writableSubpaths = append(writableSubpaths, `  (subpath "`+q(m.HostPath)+`")`)
+	}
+	writableSubpaths = append(writableSubpaths,
+		`  (subpath "/private/tmp")`,
+		`  (subpath "/private/var/tmp")`,
+		`  (subpath "/private/var/folders")`,
+		`  (regex #"^/dev/(null|tty|zero|urandom|random|stdin|stdout|stderr|fd/.*|pty.*)$")`,
+	)
+
 	return `
 (version 1)
 (deny default)
@@ -139,23 +155,25 @@ func sbplProfile(sessionDir string) string {
 (allow file-read*)
 
 (allow file-write*
-  (subpath "` + q(sessionDir) + `")
-  (subpath "/private/tmp")
-  (subpath "/private/var/tmp")
-  (subpath "/private/var/folders")
-  (regex #"^/dev/(null|tty|zero|urandom|random|stdin|stdout|stderr|fd/.*|pty.*)$"))
+` + strings.Join(writableSubpaths, "\n") + `)
 
 (deny network*)
 `
 }
 
 // resolveWorkDir returns the absolute working directory for the
-// process: cmd.WorkingDir if provided, otherwise the session dir.
-func resolveWorkDir(sessionDir, requested string) string {
-	if requested == "" {
-		return sessionDir
+// process. Precedence: explicit cmd.WorkingDir > first writable
+// Mount.HostPath > session dir.
+func resolveWorkDir(sessionDir, requested string, mounts []sandbox.Mount) string {
+	if requested != "" {
+		return requested
 	}
-	return requested
+	for _, m := range mounts {
+		if !m.ReadOnly && m.HostPath != "" {
+			return m.HostPath
+		}
+	}
+	return sessionDir
 }
 
 // buildEnv merges the Sandbox-level env with the Command-level env.

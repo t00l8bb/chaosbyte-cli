@@ -171,6 +171,48 @@ func TestCloseTearsDownAll(t *testing.T) {
 	}
 }
 
+func TestExecHonorsMountAsWorkingDirAndWritable(t *testing.T) {
+	rt := requireBackend(t)
+
+	// Stage a "workspace" directory outside the session tempdir.
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "from-host.txt")
+	if err := os.WriteFile(marker, []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := rt.Spawn(context.Background(), sandbox.Spec{
+		Mounts: []sandbox.Mount{
+			{HostPath: workspace, SandboxPath: workspace, ReadOnly: false},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The mount should be the default WorkingDir, so `pwd` returns it.
+	proc, err := s.Exec(context.Background(), sandbox.Command{Path: "/bin/sh", Args: []string{"-c", "pwd && cat from-host.txt && echo written > written.txt"}})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	out, _ := io.ReadAll(proc.Stdout())
+	if exit, err := proc.Wait(context.Background()); err != nil || exit != 0 {
+		t.Fatalf("Wait: exit=%d err=%v out=%q", exit, err, string(out))
+	}
+	if !strings.Contains(string(out), workspace) {
+		t.Errorf("pwd output should contain %q, got %q", workspace, string(out))
+	}
+	if !strings.Contains(string(out), "seed") {
+		t.Errorf("cat output should contain seed, got %q", string(out))
+	}
+	written := filepath.Join(workspace, "written.txt")
+	if body, err := os.ReadFile(written); err != nil {
+		t.Errorf("expected written.txt in mounted workspace: %v", err)
+	} else if strings.TrimSpace(string(body)) != "written" {
+		t.Errorf("written.txt = %q", string(body))
+	}
+}
+
 func TestWaitContextCancelKillsProcess(t *testing.T) {
 	rt := requireBackend(t)
 	s, err := rt.Spawn(context.Background(), sandbox.Spec{})

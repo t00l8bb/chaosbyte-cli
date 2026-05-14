@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bchayka/gitstatus/internal/identity"
+	"github.com/bchayka/gitstatus/internal/worktree"
 )
 
 // Orchestrator owns the live set of per-user sandboxes for one team
@@ -15,14 +16,29 @@ import (
 // user joins, Acquire spawns a new sandbox (if the user does not
 // already have one); when a user leaves, Release destroys it.
 //
+// When a worktree.Controller is configured, every Acquire also
+// provisions a fresh worktree clone from BaseRepo and mounts it into
+// the sandbox at MountPath. Release destroys both.
+//
 // One Orchestrator per room. The vibespace daemon constructs one
 // alongside each broker via the platform registry.
 type Orchestrator struct {
-	mu      sync.Mutex
-	runtime Runtime
+	mu          sync.Mutex
+	runtime     Runtime
 	defaultSpec Spec
-	byUser  map[uuid.UUID]Sandbox
-	closed  bool
+	worktrees   worktree.Controller
+	baseRepo    string
+	branch      string
+	mountPath   string
+	byUser      map[uuid.UUID]*session
+	closed      bool
+}
+
+// session bundles a sandbox with its optional worktree so Release can
+// tear both down together.
+type session struct {
+	sandbox  Sandbox
+	worktree worktree.Worktree
 }
 
 // NewOrchestrator wires the runtime up and prepares to allocate
@@ -32,13 +48,36 @@ func NewOrchestrator(rt Runtime, defaultSpec Spec) *Orchestrator {
 	return &Orchestrator{
 		runtime:     rt,
 		defaultSpec: defaultSpec,
-		byUser:      map[uuid.UUID]Sandbox{},
+		byUser:      map[uuid.UUID]*session{},
 	}
+}
+
+// WithWorktrees configures the Orchestrator to provision a per-session
+// worktree from baseRepo on every Acquire, mounted at mountPath inside
+// the sandbox. branch is the git branch to check out (empty means
+// HEAD). Returns the receiver for chaining.
+//
+// If baseRepo is empty the Orchestrator behaves as before: no worktree
+// is provisioned and sandboxes get an empty session directory.
+func (o *Orchestrator) WithWorktrees(ctrl worktree.Controller, baseRepo, branch, mountPath string) *Orchestrator {
+	if mountPath == "" {
+		mountPath = "/workspace"
+	}
+	o.worktrees = ctrl
+	o.baseRepo = baseRepo
+	o.branch = branch
+	o.mountPath = mountPath
+	return o
 }
 
 // Acquire returns the sandbox for the principal's current session,
 // spawning one if none exists yet. Repeated calls with the same
 // SessionID return the same Sandbox.
+//
+// When the Orchestrator has been configured with worktrees, a fresh
+// worktree is also provisioned and bind-mounted into the sandbox at
+// MountPath. The mount is appended to the sandbox Spec.Mounts so the
+// host backend's profile/bwrap args include it.
 //
 // Passing a Spec with zero fields uses the orchestrator's default;
 // non-zero fields override.
@@ -50,35 +89,63 @@ func (o *Orchestrator) Acquire(ctx context.Context, p identity.Principal, spec S
 	}
 	if existing, ok := o.byUser[p.SessionID]; ok {
 		o.mu.Unlock()
-		return existing, nil
+		return existing.sandbox, nil
 	}
 	o.mu.Unlock()
 
 	mergedSpec := mergeSpec(o.defaultSpec, spec)
+
+	// If a worktree controller is configured, provision the user's
+	// workspace first so the host backend sees its path in
+	// mergedSpec.Mounts when it builds the fence.
+	var wt worktree.Worktree
+	if o.worktrees != nil && o.baseRepo != "" {
+		var err error
+		wt, err = o.worktrees.Provision(ctx, worktree.Spec{
+			BaseRepo: o.baseRepo,
+			Branch:   o.branch,
+			Label:    safeLabel(p.DisplayName),
+		})
+		if err != nil {
+			return nil, err
+		}
+		mergedSpec.Mounts = append(mergedSpec.Mounts, Mount{
+			HostPath:    wt.Path(),
+			SandboxPath: o.mountPath,
+			ReadOnly:    false,
+		})
+	}
+
 	s, err := o.runtime.Spawn(ctx, mergedSpec)
 	if err != nil {
+		if wt != nil {
+			_ = wt.Destroy(ctx)
+		}
 		return nil, err
 	}
 
 	o.mu.Lock()
 	if other, ok := o.byUser[p.SessionID]; ok {
-		// A racing Acquire beat us. Destroy our duplicate and return
-		// the winner.
+		// A racing Acquire beat us. Tear down our duplicates and
+		// return the winner.
 		o.mu.Unlock()
 		_ = s.Destroy(ctx)
-		return other, nil
+		if wt != nil {
+			_ = wt.Destroy(ctx)
+		}
+		return other.sandbox, nil
 	}
-	o.byUser[p.SessionID] = s
+	o.byUser[p.SessionID] = &session{sandbox: s, worktree: wt}
 	o.mu.Unlock()
 	return s, nil
 }
 
-// Release destroys the sandbox associated with the principal's
-// session. Safe to call even if the principal had no sandbox; returns
-// nil in that case.
+// Release destroys the sandbox (and any attached worktree) associated
+// with the principal's session. Safe to call even if the principal
+// had no sandbox; returns nil in that case.
 func (o *Orchestrator) Release(ctx context.Context, p identity.Principal) error {
 	o.mu.Lock()
-	s, ok := o.byUser[p.SessionID]
+	sess, ok := o.byUser[p.SessionID]
 	if ok {
 		delete(o.byUser, p.SessionID)
 	}
@@ -86,7 +153,13 @@ func (o *Orchestrator) Release(ctx context.Context, p identity.Principal) error 
 	if !ok {
 		return nil
 	}
-	return s.Destroy(ctx)
+	err := sess.sandbox.Destroy(ctx)
+	if sess.worktree != nil {
+		if werr := sess.worktree.Destroy(ctx); werr != nil && err == nil {
+			err = werr
+		}
+	}
+	return err
 }
 
 // Lookup returns the sandbox associated with a session without
@@ -94,11 +167,15 @@ func (o *Orchestrator) Release(ctx context.Context, p identity.Principal) error 
 func (o *Orchestrator) Lookup(sessionID uuid.UUID) Sandbox {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.byUser[sessionID]
+	if sess, ok := o.byUser[sessionID]; ok {
+		return sess.sandbox
+	}
+	return nil
 }
 
-// Close destroys every live sandbox and shuts the underlying Runtime
-// down. The orchestrator becomes unusable afterward.
+// Close destroys every live sandbox and worktree and shuts the
+// underlying Runtime down. The orchestrator becomes unusable
+// afterward.
 func (o *Orchestrator) Close(ctx context.Context) error {
 	o.mu.Lock()
 	if o.closed {
@@ -106,24 +183,57 @@ func (o *Orchestrator) Close(ctx context.Context) error {
 		return nil
 	}
 	o.closed = true
-	live := make([]Sandbox, 0, len(o.byUser))
+	live := make([]*session, 0, len(o.byUser))
 	for _, s := range o.byUser {
 		live = append(live, s)
 	}
 	o.byUser = nil
 	rt := o.runtime
+	ctrl := o.worktrees
 	o.mu.Unlock()
 
 	var firstErr error
-	for _, s := range live {
-		if err := s.Destroy(ctx); err != nil && firstErr == nil {
+	for _, sess := range live {
+		if err := sess.sandbox.Destroy(ctx); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		if sess.worktree != nil {
+			if err := sess.worktree.Destroy(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	if err := rt.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if ctrl != nil {
+		if err := ctrl.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
+}
+
+// safeLabel returns a filesystem-safe label derived from a display
+// name. Used for worktree directory naming so the path is human
+// navigable.
+func safeLabel(name string) string {
+	if name == "" {
+		return "session"
+	}
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			out = append(out, r)
+		default:
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "session"
+	}
+	return string(out)
 }
 
 // Live returns the number of currently-bound sandboxes. Used by the
