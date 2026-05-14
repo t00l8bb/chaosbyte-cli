@@ -137,7 +137,7 @@ func (d *Dispatcher) execute(ctx context.Context, chat *events.ChatPosted, cmd P
 
 	// Publish the structured "issued" event so subscribers can render
 	// "Daniel ran: cargo test" or similar before output starts.
-	issued := events.NewSandboxCommandIssued(d.roomID, actor, commandID, actor.SessionID, cmd.Argv)
+	issued := events.NewSandboxCommandIssued(d.roomID, actor, commandID, actor.SessionID, chat.Channel, cmd.Argv)
 	_ = d.broker.PublishEvent(issued)
 
 	principal := identity.Principal{

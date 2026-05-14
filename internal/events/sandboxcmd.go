@@ -25,6 +25,7 @@ type SandboxCommandIssued struct {
 
 	CommandID  uuid.UUID `json:"command_id"`
 	SessionID  uuid.UUID `json:"session_id"`
+	Channel    string    `json:"channel"`
 	Argv       []string  `json:"argv"`
 	WorkingDir string    `json:"working_dir,omitempty"`
 	TTY        bool      `json:"tty,omitempty"`
@@ -33,6 +34,7 @@ type SandboxCommandIssued struct {
 type sandboxCommandIssuedPayload struct {
 	CommandID  uuid.UUID `json:"command_id"`
 	SessionID  uuid.UUID `json:"session_id"`
+	Channel    string    `json:"channel"`
 	Argv       []string  `json:"argv"`
 	WorkingDir string    `json:"working_dir,omitempty"`
 	TTY        bool      `json:"tty,omitempty"`
@@ -44,6 +46,7 @@ func (e *SandboxCommandIssued) MarshalPayload() (json.RawMessage, error) {
 	return json.Marshal(sandboxCommandIssuedPayload{
 		CommandID:  e.CommandID,
 		SessionID:  e.SessionID,
+		Channel:    e.Channel,
 		Argv:       e.Argv,
 		WorkingDir: e.WorkingDir,
 		TTY:        e.TTY,
@@ -52,11 +55,12 @@ func (e *SandboxCommandIssued) MarshalPayload() (json.RawMessage, error) {
 
 // NewSandboxCommandIssued constructs an event for a parsed slash
 // command. The broker assigns ID and Stamp on Publish.
-func NewSandboxCommandIssued(room string, actor Actor, commandID, sessionID uuid.UUID, argv []string) *SandboxCommandIssued {
+func NewSandboxCommandIssued(room string, actor Actor, commandID, sessionID uuid.UUID, channel string, argv []string) *SandboxCommandIssued {
 	return &SandboxCommandIssued{
 		Header:    NewHeader(room, actor),
 		CommandID: commandID,
 		SessionID: sessionID,
+		Channel:   channel,
 		Argv:      argv,
 	}
 }

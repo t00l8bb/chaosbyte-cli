@@ -184,7 +184,7 @@ func Unmarshal(data []byte) (Event, error) {
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return nil, fmt.Errorf("events: unmarshal sandbox.command.issued payload: %w", err)
 		}
-		return &SandboxCommandIssued{Header: h, CommandID: p.CommandID, SessionID: p.SessionID, Argv: p.Argv, WorkingDir: p.WorkingDir, TTY: p.TTY}, nil
+		return &SandboxCommandIssued{Header: h, CommandID: p.CommandID, SessionID: p.SessionID, Channel: p.Channel, Argv: p.Argv, WorkingDir: p.WorkingDir, TTY: p.TTY}, nil
 	case kindSandboxCommandOutput:
 		var p sandboxCommandOutputPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
