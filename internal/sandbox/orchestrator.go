@@ -140,6 +140,72 @@ func (o *Orchestrator) Acquire(ctx context.Context, p identity.Principal, spec S
 	return s, nil
 }
 
+// Reprovision tears down the principal's current sandbox + worktree
+// (if any) and provisions fresh ones rooted at baseRepo and branch.
+// Used by the /pull verb: the user supplies a different repo and
+// gets a clean sandbox bound to it.
+//
+// If baseRepo is empty the session ends up with an empty sandbox and
+// no worktree mount, matching the /scratch verb's eventual shape.
+func (o *Orchestrator) Reprovision(ctx context.Context, p identity.Principal, baseRepo, branch string) (Sandbox, error) {
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return nil, ErrRuntimeClosed
+	}
+	if o.worktrees == nil {
+		o.mu.Unlock()
+		return nil, errors.New("orchestrator: no worktree controller configured; cannot reprovision")
+	}
+	prev := o.byUser[p.SessionID]
+	delete(o.byUser, p.SessionID)
+	ctrl := o.worktrees
+	mountPath := o.mountPath
+	mergedSpec := o.defaultSpec
+	o.mu.Unlock()
+
+	// Tear down the previous session first so we never run two
+	// sandboxes for one user. Errors are best-effort.
+	if prev != nil {
+		_ = prev.sandbox.Destroy(ctx)
+		if prev.worktree != nil {
+			_ = prev.worktree.Destroy(ctx)
+		}
+	}
+
+	var wt worktree.Worktree
+	if baseRepo != "" {
+		w, err := ctrl.Provision(ctx, worktree.Spec{
+			BaseRepo: baseRepo,
+			Branch:   branch,
+			Label:    safeLabel(p.DisplayName),
+		})
+		if err != nil {
+			return nil, err
+		}
+		wt = w
+		mergedSpec.Mounts = append([]Mount{}, mergedSpec.Mounts...)
+		mergedSpec.Mounts = append(mergedSpec.Mounts, Mount{
+			HostPath:    w.Path(),
+			SandboxPath: mountPath,
+			ReadOnly:    false,
+		})
+	}
+
+	s, err := o.runtime.Spawn(ctx, mergedSpec)
+	if err != nil {
+		if wt != nil {
+			_ = wt.Destroy(ctx)
+		}
+		return nil, err
+	}
+
+	o.mu.Lock()
+	o.byUser[p.SessionID] = &session{sandbox: s, worktree: wt}
+	o.mu.Unlock()
+	return s, nil
+}
+
 // Release destroys the sandbox (and any attached worktree) associated
 // with the principal's session. Safe to call even if the principal
 // had no sandbox; returns nil in that case.

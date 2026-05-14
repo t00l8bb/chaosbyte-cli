@@ -2,6 +2,9 @@ package dispatch_test
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -15,7 +18,43 @@ import (
 	"github.com/bchayka/gitstatus/internal/sandbox"
 	sbhost "github.com/bchayka/gitstatus/internal/sandbox/host"
 	"github.com/bchayka/gitstatus/internal/ui"
+	"github.com/bchayka/gitstatus/internal/worktree"
+	"github.com/bchayka/gitstatus/internal/worktree/plain"
 )
+
+// setupBareRepoForDispatchTest builds a bare git repo seeded with one
+// commit and returns its absolute path. Used by /pull e2e tests.
+func setupBareRepoForDispatchTest(t *testing.T) string {
+	t.Helper()
+	work := t.TempDir()
+	run := func(dir, name string, args ...string) {
+		cmd := exec.Command(name, args...)
+		if dir != "" {
+			cmd.Dir = dir
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s %v: %v\n%s", name, args, err, string(out))
+		}
+	}
+	run(work, "git", "init", "-q", "-b", "main")
+	run(work, "git", "config", "user.name", "test")
+	run(work, "git", "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("dispatch test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(work, "git", "add", "README.md")
+	run(work, "git", "commit", "-q", "-m", "initial")
+
+	bare := filepath.Join(t.TempDir(), "repo.git")
+	run("", "git", "clone", "--bare", work, bare)
+	return bare
+}
+
+// plainController returns a plain worktree.Controller rooted at the
+// supplied dir. Used by /pull e2e tests.
+func plainController(root string) (worktree.Controller, error) {
+	return plain.New(root)
+}
 
 // TestEndToEndChatToRealSandbox boots a real room.Broker, a real
 // host.Runtime (sandbox-exec or bwrap), a real Orchestrator and a
@@ -166,6 +205,129 @@ func TestPresenceLeftReleasesSandbox(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("Live after PresenceLeft = %d, want 0", orch.Live())
+}
+
+// TestPullSwapsWorkspaceToUserSuppliedRepo proves the /pull verb:
+// the user posts /pull /path/to/bare.git, the orchestrator
+// re-provisions a worktree from that repo, and the next /run lands
+// in the new workspace.
+func TestPullSwapsWorkspaceToUserSuppliedRepo(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("host sandbox only on darwin/linux, got %s", runtime.GOOS)
+	}
+	bare := setupBareRepoForDispatchTest(t)
+
+	rt, err := sbhost.New(t.TempDir())
+	if err != nil {
+		t.Skipf("host backend unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+
+	wtCtrl, err := plainController(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(wtCtrl, "", "", "/workspace")
+	b := room.New("test", nil, nil, nil)
+	defer b.Stop()
+
+	d := dispatch.New(b, orch, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop()
+
+	_, obs := b.Subscribe()
+	actor := events.Actor{ID: "pk:test", DisplayName: "@daniel", Kind: "human", SessionID: uuid.New()}
+
+	// 1. /pull <bare-repo-path>
+	pull := events.NewChatPosted("test", actor, "#lobby", "/pull "+bare, ui.ChatNormal)
+	if err := b.PublishEvent(pull); err != nil {
+		t.Fatal(err)
+	}
+	drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if c, ok := e.(*events.SandboxCommandCompleted); ok && c.ExitCode == 0 {
+				return true
+			}
+		}
+		return false
+	})
+
+	// 2. /run ls should now list the seed file from the pulled repo.
+	ls := events.NewChatPosted("test", actor, "#lobby", "/run ls", ui.ChatNormal)
+	if err := b.PublishEvent(ls); err != nil {
+		t.Fatal(err)
+	}
+	got := drainUntil(t, obs, 5*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if _, ok := e.(*events.SandboxCommandCompleted); ok {
+				return true
+			}
+		}
+		return false
+	})
+	var stdoutBody strings.Builder
+	for _, e := range got {
+		if v, ok := e.(*events.SandboxCommandOutput); ok && v.Stream == events.StreamStdout {
+			stdoutBody.Write(v.Chunk)
+		}
+	}
+	if !strings.Contains(stdoutBody.String(), "README.md") {
+		t.Errorf("ls after /pull should list README.md, got %q", stdoutBody.String())
+	}
+}
+
+// TestPullRejectsRemoteURL confirms the /pull verb refuses anything
+// that looks like a remote URL today (network is denied by the fence).
+func TestPullRejectsRemoteURL(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("host sandbox only on darwin/linux, got %s", runtime.GOOS)
+	}
+	rt, err := sbhost.New(t.TempDir())
+	if err != nil {
+		t.Skipf("host backend unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	wtCtrl, err := plainController(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := sandbox.NewOrchestrator(rt, sandbox.Spec{}).
+		WithWorktrees(wtCtrl, "", "", "/workspace")
+	b := room.New("test", nil, nil, nil)
+	defer b.Stop()
+
+	d := dispatch.New(b, orch, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = d.Start(ctx)
+	defer d.Stop()
+
+	_, obs := b.Subscribe()
+	actor := events.Actor{ID: "pk:test", DisplayName: "@d", Kind: "human", SessionID: uuid.New()}
+	_ = b.PublishEvent(events.NewChatPosted("test", actor, "#lobby", "/pull https://github.com/foo/bar.git", ui.ChatNormal))
+	got := drainUntil(t, obs, 3*time.Second, func(evts []events.Event) bool {
+		for _, e := range evts {
+			if c, ok := e.(*events.SandboxCommandCompleted); ok && c.Error != "" {
+				return true
+			}
+		}
+		return false
+	})
+	found := false
+	for _, e := range got {
+		if c, ok := e.(*events.SandboxCommandCompleted); ok && strings.Contains(c.Error, "remote pull requires") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected /pull rejection for remote URL, got events %v", got)
+	}
 }
 
 // TestDispatcherSurvivesCommandPanic exercises the recover() guard:

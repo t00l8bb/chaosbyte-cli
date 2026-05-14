@@ -24,8 +24,9 @@ import (
 type Verb string
 
 const (
-	VerbRun Verb = "run"
-	VerbSh  Verb = "sh"
+	VerbRun  Verb = "run"
+	VerbSh   Verb = "sh"
+	VerbPull Verb = "pull"
 )
 
 // ParsedCommand is the structured form of a recognized slash command.
@@ -33,7 +34,7 @@ type ParsedCommand struct {
 	Verb Verb
 	Argv []string
 	// Raw is the body after the verb, useful for verbs whose Argv is a
-	// single shell line (/sh).
+	// single shell line (/sh) or a single path argument (/pull).
 	Raw string
 }
 
@@ -77,6 +78,16 @@ func Parse(body string) (ParsedCommand, error) {
 			Verb: VerbSh,
 			Argv: []string{"/bin/sh", "-c", rest},
 			Raw:  rest,
+		}, nil
+	case VerbPull:
+		path := strings.TrimSpace(rest)
+		if path == "" {
+			return ParsedCommand{}, fmt.Errorf("dispatch: /pull requires a path or url")
+		}
+		return ParsedCommand{
+			Verb: VerbPull,
+			Argv: []string{path},
+			Raw:  path,
 		}, nil
 	default:
 		return ParsedCommand{}, ErrNotACommand

@@ -35,6 +35,31 @@ func TestParseRun(t *testing.T) {
 	}
 }
 
+func TestParsePull(t *testing.T) {
+	got, err := dispatch.Parse("/pull /tmp/foo.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Verb != dispatch.VerbPull {
+		t.Errorf("Verb = %q, want pull", got.Verb)
+	}
+	if got.Raw != "/tmp/foo.git" {
+		t.Errorf("Raw = %q, want /tmp/foo.git", got.Raw)
+	}
+	if !reflect.DeepEqual(got.Argv, []string{"/tmp/foo.git"}) {
+		t.Errorf("Argv = %v", got.Argv)
+	}
+}
+
+func TestParsePullRequiresPath(t *testing.T) {
+	if _, err := dispatch.Parse("/pull"); err == nil {
+		t.Error("/pull without argument should error")
+	}
+	if _, err := dispatch.Parse("/pull   "); err == nil {
+		t.Error("/pull with whitespace-only argument should error")
+	}
+}
+
 func TestParseSh(t *testing.T) {
 	got, err := dispatch.Parse(`/sh echo hi | wc -l`)
 	if err != nil {
