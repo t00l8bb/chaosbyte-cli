@@ -179,11 +179,16 @@ func main() {
 		wish.WithHostKeyPath(*keyPath),
 		wish.WithPublicKeyAuth(authFn(allowlist)),
 		wish.WithMiddleware(
-			// TrueColor floor: bm.MakeRenderer downgrades to the session
-			// context's minColorProfile, which defaults to Ascii. Raising
-			// the floor keeps the team palette intact for any modern
-			// terminal client.
-			bm.MiddlewareWithColorProfile(handlerFor(registry, allowlist, issuer), termenv.TrueColor),
+			// ANSI256 floor: bm.MakeRenderer defaults to Ascii when the
+			// session context has no minColorProfile, which breaks the
+			// palette on every connect. We raise the floor to ANSI256
+			// so the team theme always renders. TrueColor (38;2;R;G;B)
+			// is intentionally NOT forced because some terminal clients
+			// strip those sequences rather than approximate them; the
+			// strip is what was producing the black-and-white loadup
+			// screen Daniel saw on SSH. ANSI256 (38;5;N) is the floor
+			// every modern terminal understands.
+			bm.MiddlewareWithColorProfile(handlerFor(registry, allowlist, issuer), termenv.ANSI256),
 			activeterm.Middleware(),
 			logging.Middleware(),
 		),
